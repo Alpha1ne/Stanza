@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stanza | Config files you can read line by line</title>
+  <meta name="description" content="Pick a DevOps tool, answer a few questions, and get a config file with a plain-English note beside every line.">
+  <meta id="theme-color" name="theme-color" content="#ffffff">
+
+  <!-- Set the theme before the page paints, so there is no flash of the wrong colours. -->
+  <script>
+    try {
+      var saved = localStorage.getItem('stanza-theme');
+      if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+    } catch (e) {}
+  </script>
+
+  <link rel="icon" type="image/png" sizes="32x32" href="brand/icon-32.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="brand/icon-192.png">
+  <link rel="apple-touch-icon" href="brand/icon-180.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to the generator</a>
+
+  <div class="device">
+  <header class="topbar">
+    <h1 class="sr-only">Stanza: config generators with a note beside every line</h1>
+    <a class="brand" href="#/ansible" aria-label="Stanza home">
+      <img class="logo logo-on-light" src="brand/logo-dark-text.png" alt="Stanza" width="132" height="41">
+      <img class="logo logo-on-dark" src="brand/logo.png" alt="Stanza" width="132" height="41">
+    </a>
+    <p class="pitch">Pick a tool, answer a few questions, and get a config you can read line by line.</p>
+    <div class="top-actions">
+      <button type="button" id="jump" class="jump" aria-haspopup="dialog" aria-label="Jump to a generator">
+        <span class="ico" data-icon="search"></span>
+        <span class="jump-label">Jump to</span>
+        <kbd id="kbd" aria-hidden="true" data-key="Ctrl K"></kbd>
+      </button>
+      <button type="button" id="theme" class="icon-btn" aria-label="Switch theme"></button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav id="explorer" class="explorer" aria-label="Tools and generators"></nav>
+
+    <main id="main" class="stage">
+      <section id="planned" class="planned" aria-live="polite" hidden></section>
+
+      <div id="reference" class="cmds" hidden></div>
+
+      <div class="bench">
+        <form id="form" class="questions" aria-labelledby="form-title" novalidate>
+          <noscript>Stanza needs JavaScript to build configs. Turn it on for this page and reload.</noscript>
+        </form>
+
+        <section class="output" aria-labelledby="file-name">
+          <h2 id="file-name" class="sr-only"></h2>
+
+          <div class="editor">
+            <div id="tabrow" class="tabrow">
+              <nav id="files" class="files" aria-label="Files in this build"></nav>
+            </div>
+            <div class="toolbar">
+              <p id="crumb" class="crumb"></p>
+              <div class="actions">
+                <button type="button" id="notes" class="btn quiet" aria-pressed="true"><span class="ico" data-icon="notes"></span><span class="label">Notes</span></button>
+                <button type="button" id="copy" class="btn primary"><span class="ico" data-icon="copy"></span><span class="label">Copy</span></button>
+                <button type="button" id="download" class="btn quiet"><span class="ico" data-icon="download"></span><span class="label">Download</span></button>
+                <button type="button" id="download-all" class="btn quiet" hidden><span class="ico" data-icon="archive"></span><span class="label">All files (.zip)</span></button>
+              </div>
+            </div>
+
+            <div id="sheet" class="sheet"></div>
+
+            <div id="statusbar" class="statusbar" data-state="ok">
+              <span class="state"><span class="dot" aria-hidden="true"></span><span id="st-state"></span></span>
+              <span id="st-lang"></span>
+              <span id="st-lines"></span>
+              <span id="st-files"></span>
+            </div>
+          </div>
+
+          <section id="run" class="terminal" aria-labelledby="run-title"></section>
+        </section>
+      </div>
+    </main>
+  </div>
+  </div>
+
+  <footer class="foot">
+    <p>Ansible, Terraform and Docker are trademarks of their owners (Red Hat, HashiCorp and Docker, Inc.). Their logos appear here only to name each tool. Stanza is an independent project and is not affiliated with them. Logo shapes come from the Simple Icons project.</p>
+  </footer>
+
+  <dialog id="palette" class="palette" aria-label="Jump to a generator">
+    <div class="pal-box">
+      <input id="pal-q" type="text" autocomplete="off" spellcheck="false" placeholder="Jump to a generator" role="combobox" aria-expanded="true" aria-controls="pal-list" aria-autocomplete="list" aria-label="Jump to a generator">
+      <ul id="pal-list" class="pal-list" role="listbox" aria-label="Generators"></ul>
+      <p class="pal-hint">Up and down to move, Enter to open, Esc to close.</p>
+    </div>
+  </dialog>
+
+  <p id="status" class="sr-only" role="status"></p>
+
+  <script src="terraform.js"></script>
+  <script src="tools.js"></script>
+  <script src="commands.js"></script>
+  <script src="modules.js"></script>
+  <script src="concepts.js"></script>
+  <script src="tf-commands.js"></script>
+  <script src="tf-concepts.js"></script>
+  <script src="tf-resources.js"></script>
+  <script src="zip.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
