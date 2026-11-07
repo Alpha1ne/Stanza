@@ -12,6 +12,10 @@ Stanza is a no-backend web app that writes DevOps configuration files for you. P
 - Generators: provider setup, security groups, EC2 instances and S3 buckets.
 - Reference pages: commands, the HCL language and common AWS resources.
 
+**Jenkins**
+- Generators: a build-and-test pipeline and a deploy pipeline (Docker image and SSH, with passwords kept in Jenkins credentials). The output is a Groovy `Jenkinsfile`.
+- Reference pages: pipeline concepts and steps.
+
 **Planned**
 - Docker: Dockerfile and Docker Compose.
 
@@ -33,13 +37,15 @@ Nothing is uploaded. Everything runs in the browser with plain HTML, CSS and Jav
 | `app.js` | Routing, the form, the file tabs, the notes and the reference pages. |
 | `tools.js` | The Ansible generators and the list of tools shown in the menu. |
 | `terraform.js` | The Terraform generators. |
+| `jenkins.js` | The Jenkins generators (Jenkinsfile). |
 | `commands.js`, `modules.js`, `concepts.js` | Ansible reference data. |
 | `tf-commands.js`, `tf-concepts.js`, `tf-resources.js` | Terraform reference data. |
+| `jk-ref.js` | Jenkins reference data. |
 | `zip.js` | Builds the downloadable zip without any library. |
 | `brand/`, `fonts/` | Logos, icons and bundled fonts, so the page works offline. |
 | `tests/` | Browser tests (Playwright) and an accessibility check (axe-core). |
 
 ## Notes
 
-- The reference examples were checked against real tools: `ansible-core` 2.22 and OpenTofu 1.9.1 (a stand-in for Terraform). AWS resource arguments were checked against the AWS provider documentation. Nothing was applied to a real AWS account.
+- The reference examples were checked against real tools: `ansible-core` 2.22, OpenTofu 1.9.1 (a stand-in for Terraform) and a Groovy parser for the Jenkinsfiles. AWS resource arguments were checked against the AWS provider documentation. Nothing was applied to a real AWS account.
 - Ansible, Terraform and Docker are trademarks of their owners (Red Hat, HashiCorp and Docker, Inc.). Stanza is an independent project and is not affiliated with them.

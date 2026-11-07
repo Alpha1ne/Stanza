@@ -66,6 +66,9 @@
     notes: ['M5 4h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z'],
     search: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z', 'M20 20l-4-4'],
     commands: ['M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z', 'M8 9.5l2.6 2.5L8 14.5', 'M13 15h3.5'],
+    pipeline: ['M4 5h5v5H4z', 'M15 14h5v5h-5z', 'M9 7.5h2a4 4 0 0 1 4 4V14'],
+    deploy: ['M12 17V4', 'M7 9l5-5 5 5', 'M5 20h14'],
+    steps: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
     provider: ['M7 18a4 4 0 0 1-.6-7.96A5.5 5.5 0 0 1 17 8.5a4.5 4.5 0 0 1 .5 9.5z'],
     sg: ['M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z', 'M9 12l2 2 4-4'],
     ec2: ['M7 7h10v10H7z', 'M10 10h4v4h-4z', 'M9 3v4', 'M15 3v4', 'M9 17v4', 'M15 17v4', 'M3 9h4', 'M3 15h4', 'M17 9h4', 'M17 15h4'],
@@ -301,6 +304,28 @@
       piece: 'The example, line by line',
       col: 'Line',
       copy: 'Copy example',
+    },
+    'jenkins/concepts': {
+      groups: JK_CONCEPT_GROUPS,
+      title: 'Jenkins pipeline concepts, explained',
+      lede: 'A Jenkinsfile is a Groovy script with a fixed outline. These are the sections and ideas you will meet in every one. Press the ? to see what each example does, line by line.',
+      find: 'Find an idea, such as agent, post or parallel',
+      noun: 'ideas',
+      piece: 'The example, line by line',
+      col: 'Line',
+      copy: 'Copy example',
+      words: JK_WORDS,
+      wordsTitle: 'New to Jenkins? Words you will see',
+    },
+    'jenkins/steps': {
+      groups: JK_STEP_GROUPS,
+      title: 'Jenkins steps, explained',
+      lede: 'A step is one action inside a stage. These are the ones you will use most. Press the ? to see what each does and what every piece means. Steps that need a plugin say so.',
+      find: 'Find a step, such as sh, junit or archiveArtifacts',
+      noun: 'steps',
+      piece: 'The step, piece by piece',
+      col: 'Part',
+      copy: 'Copy step',
     },
     'terraform/commands': {
       groups: TF_COMMAND_GROUPS,
@@ -567,6 +592,7 @@
         box = el('fieldset', {}, el('legend', { text: group.legend }));
       }
       for (const f of group.fields) box.append(buildField(f));
+      box.dataset.firstField = group.fields[0].id;
       form.append(box);
     }
   }
@@ -701,8 +727,39 @@
     return frag;
   }
 
+  // Groovy (Jenkinsfile): comments, quoted strings and the words that Jenkins pipelines use.
+  const GROOVY_WORDS = new Set([
+    'pipeline', 'agent', 'any', 'none', 'label', 'docker', 'image', 'options', 'triggers', 'parameters', 'environment',
+    'stages', 'stage', 'steps', 'post', 'always', 'success', 'failure', 'when', 'expression', 'input', 'script',
+    'timeout', 'buildDiscarder', 'logRotator', 'timestamps', 'disableConcurrentBuilds', 'pollSCM', 'cron', 'string',
+    'choice', 'booleanParam', 'withCredentials', 'usernamePassword', 'sshagent', 'sh', 'bat', 'echo', 'checkout',
+    'junit', 'archiveArtifacts', 'cleanWs', 'mail', 'parallel', 'matrix', 'tools', 'def', 'return', 'if', 'else',
+    'for', 'in', 'try', 'catch', 'finally', 'node', 'stash', 'unstash', 'retry', 'sleep', 'dir', 'withEnv', 'build',
+  ]);
+
+  function colourGroovy(text) {
+    const frag = document.createDocumentFragment();
+    const span = (cls, str) => frag.append(el('span', { class: cls, text: str }));
+    const trimmed = text.trim();
+    if (trimmed.startsWith('//')) {
+      span('doc', text);
+      return frag;
+    }
+    for (const tok of text.match(/'[^']*'|"[^"]*"|\/\/.*$|[A-Za-z_]\w*|\s+|[{}()[\],:]|./g) || []) {
+      if (/^['"]/.test(tok)) span('v', tok);
+      else if (tok.startsWith('//')) span('doc', tok);
+      else if (GROOVY_WORDS.has(tok)) span('k', tok);
+      else if (/^[{}()[\],:]$/.test(tok)) span('p', tok);
+      else frag.append(tok);
+    }
+    return frag;
+  }
+
+  const isGroovy = (path) => /(^|\/)Jenkinsfile$|\.groovy$/.test(path);
+
   function colourFor(path, text) {
     if (/\.(tf|tfvars)$/.test(path)) return colourHcl(text);
+    if (isGroovy(path)) return colourGroovy(text);
     if (isYaml(path)) return colourYaml(text);
     if (/\.(ini|cfg)$/.test(path)) return colourIni(text);
     return text;
@@ -712,6 +769,7 @@
     if (/\.ya?ml$/.test(path)) return 'YAML';
     if (/\.(ini|cfg)$/.test(path)) return 'INI';
     if (/\.(tf|tfvars)$/.test(path)) return 'Terraform (HCL)';
+    if (isGroovy(path)) return 'Groovy (Jenkinsfile)';
     if (/(^|\/)\.gitignore$/.test(path)) return 'gitignore';
     if (/\.sh$/.test(path)) return 'Shell';
     if (/\.md$/.test(path)) return 'Markdown';
@@ -911,6 +969,11 @@
       if (!f.showIf) continue;
       document.getElementById(`w-${f.id}`).hidden = !f.showIf.in.includes(values[f.showIf.field]);
     }
+    // A group whose fields are all hidden would show a lonely heading, so hide the group too.
+    for (const group of tool.groups) {
+      const box = document.querySelector(`[data-first-field="${group.fields[0].id}"]`);
+      if (box) box.hidden = group.fields.every((f) => document.getElementById(`w-${f.id}`).hidden);
+    }
   }
 
   function update() {
@@ -1011,7 +1074,9 @@
       if (!currentFiles) return;
       const file = activeFile();
       const name = file.path.split('/').pop();
-      saveBlob(new Blob([textOf(file)], { type: 'text/plain' }), name);
+      // A name with no ending, such as Jenkinsfile, must not be given a .txt by the browser.
+      const type = name.includes('.') ? 'text/plain' : 'application/octet-stream';
+      saveBlob(new Blob([textOf(file)], { type }), name);
       say(`Downloaded ${name}.`);
     });
 

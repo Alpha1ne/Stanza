@@ -2361,3 +2361,8 @@ select {
 .topbar .files .none {
   color: #c9c8c0;
 }
+
+fieldset[hidden],
+details.optional[hidden] {
+  display: none;
+}

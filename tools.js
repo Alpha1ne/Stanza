@@ -1691,6 +1691,8 @@ const adhoc = {
    ===================================================================== */
 
 // terraform.js defines the Terraform generators. A browser loads it first; Node needs require().
+// jenkins.js defines the Jenkins generators, loaded the same way.
+const JENKINS_TOOLS_LIST = typeof JENKINS_TOOLS !== 'undefined' ? JENKINS_TOOLS : require('./jenkins.js').JENKINS_TOOLS;
 const TERRAFORM_TOOLS_LIST = typeof TERRAFORM_TOOLS !== 'undefined' ? TERRAFORM_TOOLS : require('./terraform.js').TERRAFORM_TOOLS;
 
 const SUITES = [
@@ -1714,6 +1716,16 @@ const SUITES = [
       { id: 'commands', label: 'Commands' },
       { id: 'concepts', label: 'Concepts' },
       { id: 'resources', label: 'Resources' },
+    ],
+  },
+  {
+    id: 'jenkins',
+    label: 'Jenkins',
+    icon: 'brand/tools/jenkins.svg',
+    tools: JENKINS_TOOLS_LIST,
+    references: [
+      { id: 'concepts', label: 'Concepts' },
+      { id: 'steps', label: 'Steps' },
     ],
   },
   {

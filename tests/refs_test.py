@@ -1,7 +1,7 @@
 import sys
 from playwright.sync_api import sync_playwright
 BASE=sys.argv[1] if len(sys.argv)>1 else 'file:///home/claude/stanza/index.html'
-EXPECT={('ansible','commands'):('Commands',64,'vault','ping user'),('ansible','modules'):('Modules',35,'apt','copy dest'),('ansible','concepts'):('Concepts',21,'loop','when'),('terraform','commands'):('Commands',41,'workspace','state mv'),('terraform','concepts'):('Concepts',28,'for_each','dynamic block'),('terraform','resources'):('Resources',18,'subnet','route table')}
+EXPECT={('ansible','commands'):('Commands',64,'vault','ping user'),('ansible','modules'):('Modules',35,'apt','copy dest'),('ansible','concepts'):('Concepts',21,'loop','when'),('terraform','commands'):('Commands',41,'workspace','state mv'),('terraform','concepts'):('Concepts',28,'for_each','dynamic block'),('terraform','resources'):('Resources',18,'subnet','route table'),('jenkins','concepts'):('Concepts',16,'parallel','agent docker'),('jenkins','steps'):('Steps',20,'junit','retry')}
 res=[]
 def check(n,ok): res.append((n,bool(ok))); print(('PASS ' if ok else 'FAIL ')+n)
 with sync_playwright() as p:
