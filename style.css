@@ -2366,3 +2366,12 @@ fieldset[hidden],
 details.optional[hidden] {
   display: none;
 }
+
+/* The tool you are in can be folded: show that it is clickable */
+.suite[aria-expanded] {
+  cursor: pointer;
+}
+
+.suite[aria-expanded='false'] .chev {
+  transform: rotate(0deg);
+}

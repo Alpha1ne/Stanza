@@ -155,12 +155,16 @@
 
   const hrefFor = (s, t) => `#/${s.id}${t ? '/' + t.id : ''}`;
 
+  // Clicking the tool you are already in folds its list away, and clicking again opens it.
+  const folded = new Set();
+
   function renderNav() {
     const nav = $('#explorer');
     nav.replaceChildren();
 
     for (const s of SUITES) {
-      const open = s === suite && s.tools.length > 0;
+      const here = s === suite && s.tools.length > 0;
+      const open = here && !folded.has(s.id);
       const group = el('div', { class: 'group' });
 
       const link = el('a', { class: 'suite', href: hrefFor(s) });
@@ -168,6 +172,18 @@
       if (!s.tools.length) link.append(el('span', { class: 'soon', text: 'soon' }));
       else link.append(icon('chevron', 'chev'));
       if (open) link.dataset.open = 'true';
+      if (here) {
+        link.setAttribute('aria-expanded', String(open));
+        link.title = open ? `Fold the ${s.label} list` : `Open the ${s.label} list`;
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          if (folded.has(s.id)) folded.delete(s.id);
+          else folded.add(s.id);
+          renderNav();
+          const again = $(`#explorer .suite[aria-expanded]`);
+          if (again) again.focus();
+        });
+      }
       if (s === suite && view === 'planned') link.setAttribute('aria-current', 'page');
       group.append(link);
 
@@ -242,7 +258,9 @@
   // the back button both land where you were.
   function route() {
     const m = location.hash.match(/^#\/([a-z]+)(?:\/([a-z0-9]+))?/) || [];
+    const before = suite;
     suite = SUITES.find((s) => s.id === m[1]) || SUITES[0];
+    if (suite !== before) folded.delete(suite.id); // arriving in a tool always shows its list
     const ref = (suite.references || []).find((r) => r.id === m[2]) || null;
     tool = ref ? null : suite.tools.find((t) => t.id === m[2]) || suite.tools[0] || null;
     refId = ref ? ref.id : null;

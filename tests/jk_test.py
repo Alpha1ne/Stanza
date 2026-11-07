@@ -65,6 +65,14 @@ with sync_playwright() as p:
     pg.keyboard.press('Control+k'); pg.wait_for_timeout(200); pg.keyboard.type('jenkins'); pg.wait_for_timeout(200)
     n=pg.locator('#pal-list [role=option]').count() if pg.locator('#pal-list').count() else 0
     check('palette finds jenkins items', n>=4 or pg.locator('dialog [role=option]').count()>=4)
+    pg.keyboard.press('Escape'); pg.wait_for_timeout(150)
+    # fold and open the current tool's list
+    pg.goto(BASE+'#/ansible/role'); pg.wait_for_timeout(300)
+    st='#explorer .suite[aria-expanded]'
+    n0=pg.locator('.tree .leaf').count(); pg.click(st); pg.wait_for_timeout(150)
+    check('click folds the current tool list, page stays', n0>0 and pg.locator('.tree .leaf').count()==0 and pg.get_attribute(st,'aria-expanded')=='false' and pg.url.endswith('#/ansible/role'))
+    pg.click(st); pg.wait_for_timeout(150)
+    check('click again opens it', pg.locator('.tree .leaf').count()==n0)
     check('no console errors', not errs)
     # phone
     m=b.new_page(viewport={'width':320,'height':700})
