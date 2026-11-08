@@ -11,7 +11,7 @@ with sync_playwright() as p:
     pg.on('console',lambda m: errs.append(m.text) if m.type=='error' else None); pg.on('pageerror',lambda e: errs.append(str(e)))
     pg.goto(BASE+'#/jenkins'); pg.wait_for_timeout(400)
     check('jenkins lands on Pipeline', 'Build and test pipeline' in pg.locator('h2').first.inner_text())
-    check('nav: 2 generators + 2 references', [x.strip() for x in pg.locator('.tree .leaf').all_inner_texts()][-4:]==['Pipeline','Deploy pipeline','Concepts','Steps'])
+    check('nav: 7 generators + 6 references', [x.strip() for x in pg.locator('.tree .leaf').all_inner_texts()]==['Pipeline','Multibranch pipeline','Test matrix','Deploy pipeline','Shared library','Jenkins setup','Agent setup','Concepts','Steps','Variables','Plugins','Errors','Admin and CLI'])
     check('tab is Jenkinsfile in top bar', pg.locator('.topbar #files .file').all_inner_texts()==['Jenkinsfile'])
     check('language label Groovy', 'Groovy' in pg.locator('#st-lang').inner_text())
     t=code(pg); check('default file starts with pipeline', 'pipeline {' in t and 'stage(\'Test\')' in t)

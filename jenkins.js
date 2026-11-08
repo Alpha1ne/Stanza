@@ -690,4 +690,9 @@ const jkDeploy = {
 const JENKINS_TOOLS = [jkPipeline, jkDeploy];
 
 // Lets Node load this file for testing. Browsers ignore it.
-if (typeof module !== 'undefined') module.exports = { JENKINS_TOOLS, JK_PRESETS };
+if (typeof module !== 'undefined') {
+  module.exports = {
+    JENKINS_TOOLS, JK_PRESETS, JK_NAME_RE, JK_LABEL_RE, JK_CRED_RE, JK_CMD_RE, JK_GLOB_RE, JK_EMAIL_RE, JK_HOST_RE,
+    JK_IMAGES, JK_WHERE_GIT, JK_GIT_COMMANDS, JK_GIT_FLAGS, JK_UI_FLAGS, groovy, q,
+  };
+}

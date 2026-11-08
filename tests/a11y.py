@@ -7,7 +7,7 @@ with sync_playwright() as p:
     total = 0
     for scheme in ('dark', 'light'):
         pg = b.new_context(viewport={'width': 1440, 'height': 900}, color_scheme=scheme).new_page()
-        for route in ('#/ansible/inventory', '#/ansible/adhoc', '#/ansible/playbook', '#/ansible/role', '#/ansible/commands', '#/ansible/modules', '#/ansible/concepts', '#/terraform', '#/terraform/sg', '#/terraform/ec2', '#/terraform/s3', '#/terraform/commands', '#/terraform/concepts', '#/terraform/resources', '#/jenkins/pipeline', '#/jenkins/deploy', '#/jenkins/concepts', '#/jenkins/steps'):
+        for route in ('#/ansible/inventory', '#/ansible/adhoc', '#/ansible/playbook', '#/ansible/role', '#/ansible/commands', '#/ansible/modules', '#/ansible/concepts', '#/terraform', '#/terraform/sg', '#/terraform/ec2', '#/terraform/s3', '#/terraform/commands', '#/terraform/concepts', '#/terraform/resources', '#/jenkins/pipeline', '#/jenkins/deploy', '#/jenkins/concepts', '#/jenkins/multibranch', '#/jenkins/matrix', '#/jenkins/library', '#/jenkins/setup', '#/jenkins/agent', '#/jenkins/variables', '#/jenkins/plugins', '#/jenkins/errors', '#/jenkins/admin'):
             pg.goto(URL + route); pg.reload(); pg.wait_for_timeout(1300)   # let the reveal animation finish
             pg.add_script_tag(path=axe)
             r = pg.evaluate("axe.run(document, {runOnly:['wcag2a','wcag2aa','wcag21a','wcag21aa','best-practice']})")

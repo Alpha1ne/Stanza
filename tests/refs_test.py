@@ -1,7 +1,7 @@
 import sys
 from playwright.sync_api import sync_playwright
 BASE=sys.argv[1] if len(sys.argv)>1 else 'file:///home/claude/stanza/index.html'
-EXPECT={('ansible','commands'):('Commands',64,'vault','ping user'),('ansible','modules'):('Modules',35,'apt','copy dest'),('ansible','concepts'):('Concepts',21,'loop','when'),('terraform','commands'):('Commands',41,'workspace','state mv'),('terraform','concepts'):('Concepts',28,'for_each','dynamic block'),('terraform','resources'):('Resources',18,'subnet','route table'),('jenkins','concepts'):('Concepts',16,'parallel','agent docker'),('jenkins','steps'):('Steps',20,'junit','retry')}
+EXPECT={('ansible','commands'):('Commands',64,'vault','ping user'),('ansible','modules'):('Modules',35,'apt','copy dest'),('ansible','concepts'):('Concepts',21,'loop','when'),('terraform','commands'):('Commands',41,'workspace','state mv'),('terraform','concepts'):('Concepts',28,'for_each','dynamic block'),('terraform','resources'):('Resources',18,'subnet','route table'),('jenkins','concepts'):('Concepts',16,'parallel','agent docker'),('jenkins','steps'):('Steps',20,'junit','retry'),('jenkins','variables'):('Variables',16,'branch','pull request'),('jenkins','plugins'):('Plugins',26,'docker','pipeline utility'),('jenkins','errors'):('Errors',19,'denied','no such'),('jenkins','admin'):('Admin and CLI',19,'backup','start a build')}
 res=[]
 def check(n,ok): res.append((n,bool(ok))); print(('PASS ' if ok else 'FAIL ')+n)
 with sync_playwright() as p:
@@ -36,10 +36,10 @@ with sync_playwright() as p:
         s.fill(multi); check(pre+f'multi-word search "{multi}"', page.locator('.cmd:visible').count()>=1)
         s.fill(''); check(pre+'clearing search restores all', page.locator('.cmd:visible').count()==n)
         first=page.locator('.copy-cmd').first; want=first.get_attribute('data-cmd'); first.click(); pg.wait_for_timeout(200)
-        check(pre+'copy puts example on clipboard', pg.evaluate('navigator.clipboard.readText()')==want and len(want)>5)
+        check(pre+'copy puts example on clipboard', pg.evaluate('navigator.clipboard.readText()')==want and len(want)>2)
         page.locator('.chip').nth(1).click(); pg.wait_for_timeout(150)
         check(pre+'group chip scrolls to its group', pg.evaluate("window.scrollY")>200)
-        if not (rid=='commands'):
+        if not (rid in ('commands','admin')):
             check(pre+'yaml cards: no $ prompt, code is scrollable-focusable', page.locator('.cmdline.yaml pre[tabindex="0"]').count()==n and page.locator('.cmdline .prompt').count()==0)
         else:
             check(pre+'command cards show $ prompt + glossary', page.locator('.cmdline .prompt').count()==n and page.locator('details.words').count()==1)

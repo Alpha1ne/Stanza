@@ -13,7 +13,8 @@ Stanza is a no-backend web app that writes DevOps configuration files for you. P
 - Reference pages: commands, the HCL language and common AWS resources.
 
 **Jenkins**
-- Generators: a build-and-test pipeline and a deploy pipeline (Docker image and SSH, with passwords kept in Jenkins credentials). The output is a Groovy `Jenkinsfile`.
+- Generators: build-and-test pipeline, multibranch pipeline, test matrix, deploy pipeline (Docker image and SSH, passwords kept in Jenkins credentials), shared library starter, Jenkins server setup (Docker, plugins, Configuration as Code) and build-agent setup (SSH or Docker). Pipelines are Groovy `Jenkinsfile`s.
+- Reference pages: concepts, steps, variables, plugins, errors in plain English, and admin and CLI.
 - Reference pages: pipeline concepts and steps.
 
 **Planned**
@@ -37,10 +38,11 @@ Nothing is uploaded. Everything runs in the browser with plain HTML, CSS and Jav
 | `app.js` | Routing, the form, the file tabs, the notes and the reference pages. |
 | `tools.js` | The Ansible generators and the list of tools shown in the menu. |
 | `terraform.js` | The Terraform generators. |
-| `jenkins.js` | The Jenkins generators (Jenkinsfile). |
+| `jenkins.js` | The Jenkins pipeline generators (Jenkinsfile). |
+| `jenkins-more.js` | Multibranch, matrix, library, server setup and agent generators. |
 | `commands.js`, `modules.js`, `concepts.js` | Ansible reference data. |
 | `tf-commands.js`, `tf-concepts.js`, `tf-resources.js` | Terraform reference data. |
-| `jk-ref.js` | Jenkins reference data. |
+| `jk-ref.js`, `jk-ref2.js` | Jenkins reference data. |
 | `zip.js` | Builds the downloadable zip without any library. |
 | `brand/`, `fonts/` | Logos, icons and bundled fonts, so the page works offline. |
 | `tests/` | Browser tests (Playwright) and an accessibility check (axe-core). |

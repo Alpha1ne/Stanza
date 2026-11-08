@@ -1692,7 +1692,12 @@ const adhoc = {
 
 // terraform.js defines the Terraform generators. A browser loads it first; Node needs require().
 // jenkins.js defines the Jenkins generators, loaded the same way.
-const JENKINS_TOOLS_LIST = typeof JENKINS_TOOLS !== 'undefined' ? JENKINS_TOOLS : require('./jenkins.js').JENKINS_TOOLS;
+const JENKINS_TOOLS_ALL = [
+  ...(typeof JENKINS_TOOLS !== 'undefined' ? JENKINS_TOOLS : require('./jenkins.js').JENKINS_TOOLS),
+  ...(typeof JENKINS_MORE_TOOLS !== 'undefined' ? JENKINS_MORE_TOOLS : require('./jenkins-more.js').JENKINS_MORE_TOOLS),
+];
+const JENKINS_ORDER = ['pipeline', 'multibranch', 'matrix', 'deploy', 'library', 'setup', 'agent'];
+const JENKINS_TOOLS_LIST = JENKINS_ORDER.map((id) => JENKINS_TOOLS_ALL.find((x) => x.id === id));
 const TERRAFORM_TOOLS_LIST = typeof TERRAFORM_TOOLS !== 'undefined' ? TERRAFORM_TOOLS : require('./terraform.js').TERRAFORM_TOOLS;
 
 const SUITES = [
@@ -1726,6 +1731,10 @@ const SUITES = [
     references: [
       { id: 'concepts', label: 'Concepts' },
       { id: 'steps', label: 'Steps' },
+      { id: 'variables', label: 'Variables' },
+      { id: 'plugins', label: 'Plugins' },
+      { id: 'errors', label: 'Errors' },
+      { id: 'admin', label: 'Admin and CLI' },
     ],
   },
   {

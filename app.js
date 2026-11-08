@@ -68,6 +68,15 @@
     commands: ['M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z', 'M8 9.5l2.6 2.5L8 14.5', 'M13 15h3.5'],
     pipeline: ['M4 5h5v5H4z', 'M15 14h5v5h-5z', 'M9 7.5h2a4 4 0 0 1 4 4V14'],
     deploy: ['M12 17V4', 'M7 9l5-5 5 5', 'M5 20h14'],
+    multibranch: ['M6 4v16', 'M6 8h6a4 4 0 0 1 4 4v1', 'M6 16h12', 'M4 4h4v0', 'M16 13h.01'],
+    matrix: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 13h7v7h-7z'],
+    library: ['M5 4h3v16H5z', 'M10 4h3v16h-3z', 'M15.5 5.5l3-.8 3.6 14.3-3 .8z'],
+    setup: ['M4 6h16', 'M4 12h16', 'M4 18h16', 'M8 4v4', 'M16 10v4', 'M10 16v4'],
+    agent: ['M4 5h16v10H4z', 'M9 19h6', 'M12 15v4'],
+    variables: ['M8 4C6 4 6 6 6 8s0 3-2 4c2 1 2 2 2 4s0 4 2 4', 'M16 4c2 0 2 2 2 4s0 3 2 4c-2 1-2 2-2 4s0 4-2 4'],
+    plugins: ['M9 3v5', 'M15 3v5', 'M6 8h12v4a6 6 0 0 1-12 0z', 'M12 18v3'],
+    errors: ['M12 3l10 18H2z', 'M12 10v5', 'M12 18h.01'],
+    admin: ['M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M12 2v3', 'M12 19v3', 'M2 12h3', 'M19 12h3'],
     steps: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
     provider: ['M7 18a4 4 0 0 1-.6-7.96A5.5 5.5 0 0 1 17 8.5a4.5 4.5 0 0 1 .5 9.5z'],
     sg: ['M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z', 'M9 12l2 2 4-4'],
@@ -344,6 +353,54 @@
       piece: 'The step, piece by piece',
       col: 'Part',
       copy: 'Copy step',
+    },
+    'jenkins/variables': {
+      groups: JK_VAR_GROUPS,
+      title: 'Jenkins variables, explained',
+      lede: 'Jenkins fills in these values for every run. Use them in messages, file names and conditions. Press the ? to see what each one holds and where it exists.',
+      find: 'Find a variable, such as BUILD_NUMBER or BRANCH_NAME',
+      noun: 'variables',
+      piece: 'The variable, piece by piece',
+      col: 'Part',
+      copy: 'Copy example',
+      words: JK_VAR_WORDS,
+      wordsTitle: 'New to Jenkins variables? Words you will see',
+    },
+    'jenkins/plugins': {
+      groups: JK_PLUGIN_GROUPS,
+      title: 'Jenkins plugins, explained',
+      lede: 'Plugins add steps and features. Each entry gives the plugin ID to put in plugins.txt. Press the ? to see what it adds.',
+      find: 'Find a plugin, such as git, docker or slack',
+      noun: 'plugins',
+      piece: 'The plugin, piece by piece',
+      col: 'Part',
+      copy: 'Copy ID',
+      words: JK_PLUGIN_WORDS,
+      wordsTitle: 'New to Jenkins plugins? Words you will see',
+    },
+    'jenkins/errors': {
+      groups: JK_ERR_GROUPS,
+      title: 'Jenkins errors, in plain English',
+      lede: 'Find the message in the run’s Console Output and match it here. Each entry says what it means and how to fix it.',
+      find: 'Find an error, such as permission denied or offline',
+      noun: 'errors',
+      piece: 'The message, piece by piece',
+      col: 'Part',
+      copy: 'Copy message',
+      words: JK_ERR_WORDS,
+      wordsTitle: 'New to reading Jenkins errors? Words you will see',
+    },
+    'jenkins/admin': {
+      groups: JK_ADMIN_GROUPS,
+      title: 'Jenkins admin and CLI, explained',
+      lede: 'Look after a Jenkins server from a terminal: the command-line program, plugins, and the Docker setup. Press the ? to see what every piece means.',
+      find: 'Find a task, such as backup, restart or list-jobs',
+      noun: 'tasks',
+      piece: 'The command, piece by piece',
+      col: 'Part',
+      copy: 'Copy command',
+      words: JK_ADMIN_WORDS,
+      wordsTitle: 'New to Jenkins admin? Words you will see',
     },
     'terraform/commands': {
       groups: TF_COMMAND_GROUPS,
@@ -790,6 +847,9 @@
     if (isGroovy(path)) return 'Groovy (Jenkinsfile)';
     if (/(^|\/)\.gitignore$/.test(path)) return 'gitignore';
     if (/\.sh$/.test(path)) return 'Shell';
+    if (/(^|\/)Dockerfile$/.test(path)) return 'Dockerfile';
+    if (/(^|\/)\.env(\.example)?$/.test(path)) return '.env file';
+    if (/(^|\/)plugins\.txt$/.test(path)) return 'Plugin list';
     if (/\.md$/.test(path)) return 'Markdown';
     if (/\.j2$/.test(path)) return 'Jinja2';
     return 'Text';
@@ -828,7 +888,7 @@
         text: 'Fix the field marked in red on the left and your file will appear here.',
       })
     );
-    $('#file-name').textContent = '';
+    $('#file-name').textContent = 'No file yet';
     $('#crumb').replaceChildren();
     $('#files').replaceChildren(el('span', { class: 'none', text: 'No file yet' }));
     updateTabFade();
