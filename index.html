@@ -8,12 +8,7 @@
   <meta id="theme-color" name="theme-color" content="#ffffff">
 
   <!-- Set the theme before the page paints, so there is no flash of the wrong colours. -->
-  <script>
-    try {
-      var saved = localStorage.getItem('stanza-theme');
-      if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
-    } catch (e) {}
-  </script>
+  <script src="theme-init.js"></script>
 
   <link rel="icon" type="image/png" sizes="32x32" href="brand/icon-32.png">
   <link rel="icon" type="image/png" sizes="192x192" href="brand/icon-192.png">
