@@ -5,7 +5,7 @@
    with a plain-English note beside every line. Commands sit in a terminal
    panel underneath.
 
-   Colour idea: cool blue-grey surfaces, with the amber-to-orange of the logo
+   Colour idea: cool blue-grey surfaces, with the lime of the logo
    used only where something is active or primary. Light ("Frost") and dark
    ("Midnight") themes share the same structure. */
 
@@ -271,34 +271,6 @@ a {
   flex: none;
   align-items: center;
   border-radius: 6px;
-}
-
-.logo {
-  display: block;
-  width: auto;
-  height: 2.3rem;
-}
-
-.logo-on-dark {
-  display: none;
-}
-
-:root[data-theme='dark'] .logo-on-light {
-  display: none;
-}
-
-:root[data-theme='dark'] .logo-on-dark {
-  display: block;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) .logo-on-light {
-    display: none;
-  }
-
-  :root:not([data-theme]) .logo-on-dark {
-    display: block;
-  }
 }
 
 .pitch {
@@ -1924,32 +1896,6 @@ select {
   background: radial-gradient(circle at 100% 0, transparent 1.5rem, var(--canvas) calc(1.5rem + 0.5px));
 }
 
-.logo-on-light {
-  display: block;
-}
-
-.logo-on-dark {
-  display: none;
-}
-
-:root[data-theme='dark'] .logo-on-light {
-  display: none;
-}
-
-:root[data-theme='dark'] .logo-on-dark {
-  display: block;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) .logo-on-light {
-    display: none;
-  }
-
-  :root:not([data-theme]) .logo-on-dark {
-    display: block;
-  }
-}
-
 .pitch {
   align-self: center;
   margin-left: 1rem;
@@ -2291,10 +2237,6 @@ select {
     padding: 0.45rem 1.1rem 0.4rem 0.9rem;
   }
 
-  .logo {
-    height: 1.9rem;
-  }
-
   .jump-label,
   .jump kbd {
     display: none;
@@ -2374,4 +2316,54 @@ details.optional[hidden] {
 
 .suite[aria-expanded='false'] .chev {
   transform: rotate(0deg);
+}
+
+
+/* Logo: the hexagon mark and the word "Stanza", drawn in the page's own display font. */
+.brand {
+  gap: 0.6rem;
+  text-decoration: none;
+}
+
+.mark {
+  display: block;
+  flex: none;
+  width: 2.3rem;
+  height: 2.3rem;
+  --m-light: #e9f642;
+  --m-mid: #cbe02a;
+  --m-dark: #a9be16;
+  --m-term: #15160d;
+}
+
+.mark .m-light { fill: var(--m-light); }
+.mark .m-mid { fill: var(--m-mid); }
+.mark .m-dark { fill: var(--m-dark); }
+.mark .m-term { fill: var(--m-term); }
+.mark .m-stroke {
+  fill: none;
+  stroke: var(--m-light);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wordmark {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 1.65rem;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+@media (max-width: 48rem) {
+  .mark {
+    width: 1.9rem;
+    height: 1.9rem;
+  }
+
+  .wordmark {
+    font-size: 1.4rem;
+  }
 }
