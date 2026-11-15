@@ -63,6 +63,8 @@
     check: ['M5 12.5l4.5 4.5L19 7.5'],
     download: ['M12 4v11', 'M7 11l5 5 5-5', 'M5 20h14'],
     archive: ['M4 8h16v12H4z', 'M3 4h18v4H3z', 'M10 12.5h4'],
+    play: ['M7 4.5v15l12-7.5z'],
+    test: ['M9 3h6', 'M10 3v6L5 19.2a1 1 0 0 0 .9 1.5h12.2a1 1 0 0 0 .9-1.5L14 9V3', 'M7.5 15h9'],
     notes: ['M5 4h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z'],
     search: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z', 'M20 20l-4-4'],
     commands: ['M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z', 'M8 9.5l2.6 2.5L8 14.5', 'M13 15h3.5'],
@@ -276,6 +278,7 @@
     view = ref ? 'reference' : tool ? 'tool' : 'planned';
     changedTabs.clear();
     activePath = null;
+    testOpen = false;
     renderNav();
     document.title =
       view === 'reference'
@@ -1032,6 +1035,155 @@
     );
   }
 
+
+  /* ---------- Test: checks and a simulated dry run ---------- */
+
+  let testOpen = false;
+  let dryTimers = [];
+  const reducedMotion = () => window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const LEVEL_MARK = { pass: '✓', warn: '!', error: '✕', info: 'i' };
+  const LEVEL_WORD = { pass: 'Passed', warn: 'Warning', error: 'Error', info: 'Note' };
+
+  function jumpTo(path, lineNo) {
+    activePath = path;
+    showActiveFile(null);
+    const rows = $('#sheet').children;
+    const row = rows[lineNo - 1];
+    if (!row) return;
+    row.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    row.classList.add('flash');
+    setTimeout(() => row.classList.remove('flash'), 1600);
+  }
+
+  function dryBlock(run, animate) {
+    const out = el('pre', { class: 'dry-out', tabIndex: 0, 'aria-label': `Simulated output: ${run.title}` });
+    const spans = run.lines.map((l) => el('span', { class: `dl dl-${l.cls}`, text: l.t + '\n' }));
+    const play = el('button', { type: 'button', class: 'btn quiet small' }, icon('play'), el('span', { class: 'label', text: 'Replay' }));
+    const skip = el('button', { type: 'button', class: 'btn quiet small', text: 'Show all' });
+    const stop = () => {
+      dryTimers.forEach(clearInterval);
+      dryTimers = [];
+    };
+    const showAll = () => {
+      stop();
+      out.replaceChildren(...spans);
+    };
+    const start = () => {
+      stop();
+      out.replaceChildren();
+      if (reducedMotion()) return showAll();
+      let i = 0;
+      const timer = setInterval(() => {
+        if (i >= spans.length) {
+          stop();
+          out.scrollTop = 0;
+          return;
+        }
+        out.append(spans[i++]);
+        out.scrollTop = out.scrollHeight;
+      }, 38);
+      dryTimers.push(timer);
+    };
+    play.addEventListener('click', start);
+    skip.addEventListener('click', showAll);
+    const box = el(
+      'div',
+      { class: 'dry' },
+      el('div', { class: 'dry-head' }, el('div', {}, el('h4', { text: run.title }), el('p', { text: run.note })), el('div', { class: 'dry-actions' }, play, skip)),
+      out
+    );
+    if (animate) start();
+    else showAll();
+    return box;
+  }
+
+  function renderTest(animate) {
+    const panel = $('#testpanel');
+    dryTimers.forEach(clearInterval);
+    dryTimers = [];
+    $('#test').setAttribute('aria-pressed', String(testOpen));
+    if (!testOpen) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    if (!currentFiles) {
+      panel.replaceChildren(el('div', { class: 'test-head' }, el('h3', { id: 'test-title', text: 'Test' }), el('p', { text: 'Fix the highlighted answers first. The test needs a finished config to look at.' })));
+      return;
+    }
+    const res = Tester.test(currentFiles);
+    const { pass, warn, error, info } = res.counts;
+    const close = el('button', { type: 'button', class: 'btn quiet small', text: 'Close' });
+    close.addEventListener('click', () => {
+      testOpen = false;
+      renderTest(false);
+      $('#test').focus();
+    });
+    const verdict = error
+      ? `${error} problem${error === 1 ? '' : 's'} to fix before you use these files.`
+      : warn
+        ? `No errors. ${warn} warning${warn === 1 ? '' : 's'} worth a look.`
+        : 'Every check passed.';
+    const pill = (cls, n, word) => el('li', { class: `tpill t-${cls}` }, el('strong', { text: String(n) }), el('span', { text: ` ${word}` }));
+
+    // Checks, grouped by file. Files with problems start open.
+    const byFile = new Map(currentFiles.map((f) => [f.path, []]));
+    for (const c of res.checks) (byFile.get(c.file) || byFile.set(c.file, []).get(c.file)).push(c);
+    const groups = [];
+    for (const [path, list] of byFile) {
+      if (!list.length) continue;
+      const bad = list.filter((c) => c.level === 'error' || c.level === 'warn').length;
+      const det = el('details', { class: 'tgroup' });
+      const notes = list.filter((c) => c.level === 'info').length;
+      if (bad || notes) det.open = true;
+      det.append(
+        el(
+          'summary',
+          {},
+          el('span', { class: 'tfile', text: path }),
+          el('span', { class: `tsum ${bad ? 't-warn' : 't-pass'}`, text: bad ? `${bad} to look at` : notes ? `${list.length - notes} passed, ${notes} note${notes === 1 ? '' : 's'}` : `${list.length} passed` })
+        )
+      );
+      const ul = el('ul', { class: 'tlist' });
+      const order = { error: 0, warn: 1, info: 2, pass: 3 };
+      for (const c of [...list].sort((x, y) => order[x.level] - order[y.level])) {
+        const li = el(
+          'li',
+          { class: `tcheck t-${c.level}` },
+          el('span', { class: 'tmark', 'aria-hidden': 'true', text: LEVEL_MARK[c.level] }),
+          el('span', { class: 'sr-only', text: LEVEL_WORD[c.level] + ': ' }),
+          el('div', {}, el('strong', { text: c.name }), el('span', { class: 'tdetail', text: ' ' + c.detail }))
+        );
+        if (c.line) {
+          const b = el('button', { type: 'button', class: 'tline', text: `line ${c.line}` });
+          b.setAttribute('aria-label', `Show line ${c.line} of ${path}`);
+          b.addEventListener('click', () => jumpTo(path, c.line));
+          li.append(b);
+        }
+        ul.append(li);
+      }
+      det.append(ul);
+      groups.push(det);
+    }
+
+    panel.replaceChildren(
+      el(
+        'div',
+        { class: 'test-head' },
+        el('div', {}, el('h3', { id: 'test-title', text: 'Test: checks and a simulated dry run' }), el('p', { text: 'Stanza has no server, so nothing is really run and nothing leaves your browser. It checks your files for mistakes, then shows what the real tool would do.' })),
+        close
+      ),
+      el('p', { class: `tverdict ${error ? 't-error' : warn ? 't-warn' : 't-pass'}`, text: verdict, role: 'status' }),
+      el('ul', { class: 'tpills' }, pill('pass', pass, 'passed'), pill('warn', warn, warn === 1 ? 'warning' : 'warnings'), pill('error', error, error === 1 ? 'error' : 'errors'), pill('info', info, info === 1 ? 'note' : 'notes')),
+      el('h4', { class: 'tsub', text: 'Checks' }),
+      ...groups,
+      ...(res.skipped.length ? [el('p', { class: 'tskipped', text: `Not checked (documentation or runs later): ${res.skipped.join(', ')}.` })] : []),
+      ...(res.runs.length ? [el('h4', { class: 'tsub', text: 'Dry run (simulated)' })] : []),
+      ...res.runs.map((r) => dryBlock(r, animate))
+    );
+  }
+
   /* ---------- Update loop ---------- */
 
   function setButtons(on) {
@@ -1039,6 +1191,7 @@
     $('#download').disabled = !on;
     $('#download-all').disabled = !on;
     $('#download-all').hidden = !on || !currentFiles || currentFiles.length < 2;
+    $('#test').disabled = !on;
   }
 
   // A field with showIf is only shown when another answer has one of the listed values.
@@ -1066,6 +1219,7 @@
       renderEmpty();
       setButtons(false);
       setStatus(errorCount, null, 0);
+      renderTest(false);
       return;
     }
 
@@ -1087,6 +1241,7 @@
     showActiveFile(changed);
     renderRun(values);
     setButtons(true);
+    renderTest(false);
   }
 
   /* ---------- Copy and download ---------- */
@@ -1132,6 +1287,12 @@
   function wireButtons() {
     // Fill in the icons that sit inside the toolbar buttons.
     document.querySelectorAll('[data-icon]').forEach((node) => node.replaceChildren(icon(node.dataset.icon)));
+
+    $('#test').addEventListener('click', () => {
+      testOpen = !testOpen;
+      renderTest(true);
+      if (testOpen) $('#testpanel').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    });
 
     const copyBtn = $('#copy');
     const copyLabel = copyBtn.querySelector('.label');

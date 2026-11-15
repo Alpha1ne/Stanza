@@ -70,6 +70,7 @@
             <div class="toolbar">
               <p id="crumb" class="crumb"></p>
               <div class="actions">
+                <button type="button" id="test" class="btn quiet" aria-pressed="false" aria-controls="testpanel"><span class="ico" data-icon="test"></span><span class="label">Test</span></button>
                 <button type="button" id="notes" class="btn quiet" aria-pressed="true"><span class="ico" data-icon="notes"></span><span class="label">Notes</span></button>
                 <button type="button" id="copy" class="btn primary"><span class="ico" data-icon="copy"></span><span class="label">Copy</span></button>
                 <button type="button" id="download" class="btn quiet"><span class="ico" data-icon="download"></span><span class="label">Download</span></button>
@@ -86,6 +87,8 @@
               <span id="st-files"></span>
             </div>
           </div>
+
+          <section id="testpanel" class="testpanel" aria-labelledby="test-title" hidden></section>
 
           <section id="run" class="terminal" aria-labelledby="run-title"></section>
         </section>
@@ -120,6 +123,7 @@
   <script src="tf-resources.js"></script>
   <script src="jk-ref.js"></script>
   <script src="jk-ref2.js"></script>
+  <script src="tester.js"></script>
   <script src="zip.js"></script>
   <script src="app.js"></script>
 </body>

@@ -1,0 +1,1524 @@
+'use strict';
+
+/*
+  tester.js — the Test button's brain.
+
+  Stanza has no server, so it cannot run Ansible, Terraform or Jenkins for real.
+  Instead this file does two honest things with the files a generator made:
+
+    1. CHECKS: reads each file and looks for mistakes (bad YAML, unbalanced
+       braces, a variable nobody declared, a risky setting).
+    2. DRY RUN: walks through the files and shows, step by step, what the real
+       tool would do. It is a simulation. Nothing is executed or sent anywhere.
+
+  Tester.test(files) takes [{ path, lines: [{ t }] }] and returns
+    { checks: [{ file, level: 'pass'|'warn'|'error'|'info', name, detail, line }],
+      runs:   [{ title, note, lines: [{ t, cls }] }],
+      counts: { pass, warn, error, info } }
+*/
+
+const Tester = (() => {
+  /* ---------------------------------------------------------------- *
+   *  A small YAML reader (the block style that Stanza writes)
+   * ---------------------------------------------------------------- */
+
+  const L = '__line';
+  const withLine = (v, n) => {
+    if (v && typeof v === 'object') Object.defineProperty(v, L, { value: n, enumerable: false, configurable: true });
+    return v;
+  };
+  const lineOf = (v) => (v && typeof v === 'object' && v[L]) || 0;
+
+  function stripComment(s) {
+    let q = null;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) {
+        if (c === '\\' && q === '"') i++;
+        else if (c === q) q = null;
+      } else if (c === '"' || c === "'") {
+        if (i === 0 || /[\s:\[{,-]/.test(s[i - 1])) q = c;
+      } else if (c === '#' && (i === 0 || /\s/.test(s[i - 1]))) {
+        return s.slice(0, i);
+      }
+    }
+    return s;
+  }
+
+  // Split "key: rest" at the first colon that is outside quotes, brackets and {{ }}.
+  function splitKey(s) {
+    let q = null;
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) {
+        if (c === '\\' && q === '"') i++;
+        else if (c === q) q = null;
+        continue;
+      }
+      if ((c === '"' || c === "'") && i === 0) {
+        q = c;
+        continue;
+      }
+      if (c === '[' || c === '{') depth++;
+      else if (c === ']' || c === '}') depth--;
+      else if (c === ':' && depth <= 0 && (i === s.length - 1 || s[i + 1] === ' ')) {
+        let key = s.slice(0, i).trim();
+        if (!key) return null;
+        if ((key[0] === '"' && key.endsWith('"')) || (key[0] === "'" && key.endsWith("'"))) key = key.slice(1, -1);
+        return [key, s.slice(i + 1).trim()];
+      }
+    }
+    return null;
+  }
+
+  function splitFlat(s) {
+    const out = [];
+    let depth = 0;
+    let q = null;
+    let cur = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) {
+        cur += c;
+        if (c === '\\' && q === '"') cur += s[++i] || '';
+        else if (c === q) q = null;
+        continue;
+      }
+      if (c === '"' || c === "'") q = c;
+      if (c === '[' || c === '{') depth++;
+      if (c === ']' || c === '}') depth--;
+      if (c === ',' && depth === 0) {
+        out.push(cur.trim());
+        cur = '';
+      } else cur += c;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+
+  function scalar(raw, n, errors) {
+    const s = raw.trim();
+    if (s === '') return null;
+    if (s[0] === '"') {
+      if (!/^"(?:[^"\\]|\\.)*"$/.test(s)) errors.push({ line: n, msg: 'A double quote is opened but not closed correctly.' });
+      return s.slice(1, -1);
+    }
+    if (s[0] === "'") {
+      if (!/^'(?:[^']|'')*'$/.test(s)) errors.push({ line: n, msg: 'A single quote is opened but not closed correctly.' });
+      return s.slice(1, -1).replace(/''/g, "'");
+    }
+    if (s[0] === '[') {
+      if (!s.endsWith(']')) {
+        errors.push({ line: n, msg: 'A [ list is not closed with ].' });
+        return [];
+      }
+      return withLine(splitFlat(s.slice(1, -1)).map((x) => scalar(x, n, errors)), n);
+    }
+    if (s[0] === '{' && !s.startsWith('{{')) {
+      if (!s.endsWith('}')) {
+        errors.push({ line: n, msg: 'A { map is not closed with }.' });
+        return {};
+      }
+      const o = {};
+      for (const part of splitFlat(s.slice(1, -1))) {
+        const kv = splitKey(part);
+        if (kv) o[kv[0]] = scalar(kv[1], n, errors);
+      }
+      return withLine(o, n);
+    }
+    if (s === 'true' || s === 'false') return s === 'true';
+    if (s === 'null' || s === '~') return null;
+    if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+    return s;
+  }
+
+  function parseYaml(text) {
+    const errors = [];
+    const raw = text.split('\n');
+    const toks = [];
+    for (let i = 0; i < raw.length; i++) {
+      const line = raw[i].replace(/\r$/, '');
+      if (/^ *\t/.test(line)) errors.push({ line: i + 1, msg: 'A tab is used for indentation. YAML allows spaces only.' });
+      const body = stripComment(line);
+      if (!body.trim() || body.trim() === '---' || body.trim() === '...') continue;
+      const indent = body.match(/^ */)[0].length;
+      const tok = { indent, s: body.trim(), n: i + 1 };
+      // A block scalar (| or >) swallows the more-indented lines that follow it.
+      if (/(^|:\s|-\s)[|>][+-]?$/.test(tok.s)) {
+        const parts = [];
+        let j = i + 1;
+        while (j < raw.length && (raw[j].trim() === '' || raw[j].match(/^ */)[0].length > indent)) {
+          parts.push(raw[j].trim());
+          j++;
+        }
+        tok.block = parts.join('\n').trim();
+        tok.s = tok.s.replace(/[|>][+-]?$/, '').trimEnd();
+        if (tok.s.endsWith(':')) tok.s += ' ';
+        i = j - 1;
+      }
+      toks.push(tok);
+    }
+
+    let pos = 0;
+
+    function parseBlock(indent) {
+      const t = toks[pos];
+      if (!t) return null;
+      if (t.s === '-' || t.s.startsWith('- ')) return parseList(t.indent);
+      if (splitKey(t.s)) return parseMap(t.indent);
+      pos++;
+      return scalar(t.s, t.n, errors);
+    }
+
+    function parseMap(indent) {
+      const obj = withLine({}, toks[pos].n);
+      while (pos < toks.length) {
+        const t = toks[pos];
+        if (t.indent < indent) break;
+        if (t.indent > indent) {
+          errors.push({ line: t.n, msg: 'This line is indented more than the lines around it.' });
+          pos++;
+          continue;
+        }
+        if (t.s === '-' || t.s.startsWith('- ')) break;
+        const kv = splitKey(t.s);
+        if (!kv) {
+          errors.push({ line: t.n, msg: 'Expected "name: value" here but found no colon.' });
+          pos++;
+          continue;
+        }
+        const [key, rest] = kv;
+        if (Object.prototype.hasOwnProperty.call(obj, key)) errors.push({ line: t.n, msg: `The key "${key}" appears twice in the same map.` });
+        pos++;
+        let value;
+        if (t.block !== undefined && rest === '') {
+          value = t.block;
+        } else if (rest === '') {
+          const nx = toks[pos];
+          if (nx && nx.indent > indent) value = parseBlock(nx.indent);
+          else if (nx && nx.indent === indent && (nx.s === '-' || nx.s.startsWith('- '))) value = parseList(indent);
+          else value = null;
+        } else {
+          value = scalar(rest, t.n, errors);
+        }
+        obj[key] = value;
+        if (value && typeof value === 'object' && !lineOf(value)) withLine(value, t.n);
+        Object.defineProperty(obj, '__lines', { value: Object.assign(obj.__lines || {}, { [key]: t.n }), enumerable: false, configurable: true });
+      }
+      return obj;
+    }
+
+    function parseList(indent) {
+      const arr = withLine([], toks[pos].n);
+      while (pos < toks.length) {
+        const t = toks[pos];
+        if (t.indent < indent) break;
+        if (t.indent > indent) {
+          errors.push({ line: t.n, msg: 'This line is indented more than the lines around it.' });
+          pos++;
+          continue;
+        }
+        if (!(t.s === '-' || t.s.startsWith('- '))) break;
+        const content = t.s === '-' ? '' : t.s.slice(2).trimStart();
+        if (content === '') {
+          pos++;
+          const nx = toks[pos];
+          arr.push(nx && nx.indent > indent ? parseBlock(nx.indent) : null);
+        } else if (splitKey(content)) {
+          // "- key: value": the rest of this item's keys line up with "key".
+          const offset = t.s.length - content.length;
+          toks[pos] = { indent: indent + offset, s: content, n: t.n, block: t.block };
+          arr.push(parseMap(indent + offset));
+        } else {
+          pos++;
+          arr.push(scalar(content, t.n, errors));
+        }
+      }
+      return arr;
+    }
+
+    let value = null;
+    if (toks.length) {
+      value = parseBlock(toks[0].indent);
+      while (pos < toks.length) {
+        errors.push({ line: toks[pos].n, msg: 'This line does not fit the structure above it. Check its indentation.' });
+        pos++;
+      }
+    }
+    return { value, errors };
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Helpers shared by the checkers
+   * ---------------------------------------------------------------- */
+
+  const textOf = (f) => f.lines.map((l) => l.t).join('\n');
+  const isArr = Array.isArray;
+  const isObj = (v) => v && typeof v === 'object' && !isArr(v);
+  const base = (p) => p.split('/').pop();
+
+  const SECRET_NAME = /(pass(word)?|passwd|secret|token|api[_-]?key|private[_-]?key)/i;
+  const PLACEHOLDER = /^(\$\{.*\}|\{\{.*\}\}|\$\w+|.*change-me.*|.*your-.*|.*paste-.*|)$/i;
+
+  /* ---------------------------------------------------------------- *
+   *  Ansible: playbooks, roles, inventory, config, ad-hoc
+   * ---------------------------------------------------------------- */
+
+  const TASK_KEYWORDS = new Set([
+    'name', 'become', 'become_user', 'become_method', 'when', 'loop', 'with_items', 'with_dict', 'with_fileglob', 'register',
+    'notify', 'tags', 'vars', 'ignore_errors', 'ignore_unreachable', 'changed_when', 'failed_when', 'delegate_to', 'args',
+    'environment', 'no_log', 'until', 'retries', 'delay', 'block', 'rescue', 'always', 'check_mode', 'diff', 'run_once',
+    'listen', 'loop_control', 'throttle', 'async', 'poll', 'connection', 'any_errors_fatal', 'delegate_facts',
+    'module_defaults', 'collections', 'local_action', 'action', 'timeout', 'remote_user', 'port', 'vars_files', 'debugger',
+  ]);
+
+  const ANSIBLE_MODULES = (() => {
+    const set = new Set();
+    try {
+      const groups = typeof MODULE_GROUPS !== 'undefined' ? MODULE_GROUPS : require('./modules.js').MODULE_GROUPS;
+      for (const g of groups) for (const c of g.commands) for (const m of c.cmd.match(/\bansible\.[a-z]+\.[a-z_]+/g) || []) set.add(m);
+    } catch (e) {
+      /* the list is optional */
+    }
+    return set;
+  })();
+
+  // In check mode these modules only look, so they report "ok" instead of "changed".
+  const READ_ONLY = new Set(['ping', 'debug', 'setup', 'stat', 'assert', 'fail', 'meta', 'wait_for', 'find', 'slurp', 'uri', 'service_facts', 'package_facts', 'gather_facts', 'set_fact', 'include_vars', 'getent']);
+
+  function moduleOf(task) {
+    if (task.local_action) return 'local_action';
+    for (const k of Object.keys(task)) if (!TASK_KEYWORDS.has(k)) return k;
+    return null;
+  }
+
+  function parseIni(text) {
+    const sections = [];
+    let cur = { name: null, items: [], line: 0 };
+    sections.push(cur);
+    text.split('\n').forEach((raw, i) => {
+      const s = raw.replace(/\r$/, '').trim();
+      if (!s || s[0] === '#' || s[0] === ';') return;
+      const m = s.match(/^\[([^\]]+)\]$/);
+      if (m) {
+        cur = { name: m[1], items: [], line: i + 1 };
+        sections.push(cur);
+      } else cur.items.push({ s, n: i + 1 });
+    });
+    return sections;
+  }
+
+  function inventoryOf(files) {
+    const f = files.find((x) => base(x.path) === 'inventory.ini');
+    if (!f) return null;
+    const groups = {};
+    const kids = {};
+    for (const sec of parseIni(textOf(f))) {
+      if (!sec.name) continue;
+      const mc = sec.name.match(/^(.+):children$/);
+      if (mc) kids[mc[1]] = sec.items.map((i) => i.s);
+      else if (/:vars$/.test(sec.name)) continue;
+      else groups[sec.name] = sec.items.map((i) => i.s.split(/\s+/)[0]);
+    }
+    const hostsOf = (g, seen = new Set()) => {
+      if (g === 'all') return [...new Set(Object.values(groups).flat())];
+      if (seen.has(g)) return [];
+      seen.add(g);
+      return [...(groups[g] || []), ...(kids[g] || []).flatMap((k) => hostsOf(k, seen))];
+    };
+    return { groups, kids, hostsOf };
+  }
+
+  function checkInventory(file, out) {
+    const text = textOf(file);
+    const secs = parseIni(text);
+    const names = new Set(secs.filter((s) => s.name).map((s) => s.name));
+    const groupNames = new Set([...names].filter((n) => !/:(children|vars)$/.test(n)));
+    let hostCount = 0;
+    const seenHosts = new Map();
+    let bad = null;
+    for (const sec of secs) {
+      if (!sec.name) {
+        if (sec.items.length && !bad) bad = { n: sec.items[0].n, d: 'This line is above every [group]. Put hosts under a [group] heading.' };
+        continue;
+      }
+      if (/:vars$/.test(sec.name)) {
+        for (const i of sec.items) if (!/^[A-Za-z_][\w]*\s*=/.test(i.s) && !bad) bad = { n: i.n, d: 'Variables must look like name=value.' };
+        continue;
+      }
+      if (/:children$/.test(sec.name)) {
+        for (const i of sec.items) {
+          if (!groupNames.has(i.s)) out.push({ file: file.path, level: 'error', name: 'Group exists', detail: `[${sec.name}] lists "${i.s}", but there is no [${i.s}] group.`, line: i.n });
+        }
+        continue;
+      }
+      for (const i of sec.items) {
+        hostCount++;
+        const host = i.s.split(/\s+/)[0];
+        if (seenHosts.has(host)) out.push({ file: file.path, level: 'warn', name: 'Unique hosts', detail: `${host} is listed in two groups. That is allowed, but check it is on purpose.`, line: i.n });
+        seenHosts.set(host, i.n);
+        for (const kv of i.s.split(/\s+/).slice(1)) if (!/^[A-Za-z_]\w*=/.test(kv) && !bad) bad = { n: i.n, d: `"${kv}" is not name=value.` };
+      }
+    }
+    out.push(bad ? { file: file.path, level: 'error', name: 'Inventory syntax', detail: bad.d, line: bad.n } : { file: file.path, level: 'pass', name: 'Inventory syntax', detail: `${groupNames.size} group(s), ${hostCount} host line(s) read correctly.` });
+    if (/ansible_(ssh_)?pass(word)?\s*=\s*[^\s{]/.test(text)) out.push({ file: file.path, level: 'warn', name: 'No passwords in the inventory', detail: 'A password is written in plain text. Use SSH keys, or Ansible Vault.' });
+    else out.push({ file: file.path, level: 'pass', name: 'No passwords in the inventory', detail: 'Logins use keys, not written passwords.' });
+  }
+
+  function checkAnsibleCfg(file, out) {
+    const secs = parseIni(textOf(file));
+    const def = secs.find((s) => s.name === 'defaults');
+    out.push(def ? { file: file.path, level: 'pass', name: '[defaults] section', detail: 'Found.' } : { file: file.path, level: 'warn', name: '[defaults] section', detail: 'Most settings belong under [defaults].' });
+    const bad = secs.flatMap((s) => s.items).find((i) => !/^[A-Za-z_]\w*\s*=/.test(i.s));
+    out.push(bad ? { file: file.path, level: 'error', name: 'Setting syntax', detail: `"${bad.s}" is not name = value.`, line: bad.n } : { file: file.path, level: 'pass', name: 'Setting syntax', detail: 'Every line is name = value.' });
+    const hk = secs.flatMap((s) => s.items).find((i) => /^host_key_checking\s*=\s*false/i.test(i.s));
+    if (hk) out.push({ file: file.path, level: 'warn', name: 'Host key checking', detail: 'Turned off. Fine in a lab, but it hides a man-in-the-middle attack. Leave it on for real machines.', line: hk.n });
+  }
+
+  function checkTasks(file, tasks, out, ctx, where) {
+    let unnamed = 0;
+    let shorts = 0;
+    for (const t of tasks) {
+      if (!isObj(t)) {
+        out.push({ file: file.path, level: 'error', name: 'Task shape', detail: 'A task must be a map such as "- name: ...", with a module under it.', line: lineOf(t) });
+        continue;
+      }
+      if (t.block) {
+        checkTasks(file, isArr(t.block) ? t.block : [], out, ctx, where);
+        continue;
+      }
+      const mod = moduleOf(t);
+      const n = lineOf(t);
+      if (!mod) {
+        out.push({ file: file.path, level: 'error', name: 'Task has a module', detail: `The task "${t.name || '(no name)'}" does not call any module.`, line: n });
+        continue;
+      }
+      if (!t.name) unnamed++;
+      if (ANSIBLE_MODULES.size && /^[a-z_]+$/.test(mod) && !['local_action', 'meta'].includes(mod)) shorts++;
+      else if (ANSIBLE_MODULES.size && /^ansible\.builtin\./.test(mod) && !ANSIBLE_MODULES.has(mod)) {
+        out.push({ file: file.path, level: 'warn', name: 'Module is known', detail: `${mod} is not in Stanza's module list. It may be misspelled.`, line: n });
+      }
+      if (/^(ansible\.builtin\.)?(command|shell|raw)$/.test(mod) && !t.changed_when && !(t.args && t.args.creates)) {
+        out.push({ file: file.path, level: 'warn', name: 'Safe to repeat', detail: `"${t.name || mod}" uses ${mod} with no changed_when, so it will report "changed" on every run.`, line: n });
+      }
+      const body = t[mod];
+      if (isObj(body)) {
+        for (const [k, v] of Object.entries(body)) {
+          if (SECRET_NAME.test(k) && typeof v === 'string' && !PLACEHOLDER.test(v) && !/^(no|yes|true|false|present|absent|none)$/i.test(v) && !/(file|path|length|state|hash|encrypt|update|policy|mode)$/i.test(k)) {
+            out.push({ file: file.path, level: 'warn', name: 'No secrets in the playbook', detail: `"${k}" holds a plain-text value. Use a variable and Ansible Vault.`, line: n });
+          }
+        }
+      }
+      if (t.notify) for (const h of isArr(t.notify) ? t.notify : [t.notify]) ctx.notified.push({ name: h, line: n });
+      if (t.register) ctx.registered.add(t.register);
+      ctx.tasks.push({ task: t, mod, where });
+    }
+    if (unnamed) out.push({ file: file.path, level: 'warn', name: 'Tasks have names', detail: `${unnamed} task(s) have no name. Names are what you read in the output.` });
+    if (shorts) out.push({ file: file.path, level: 'info', name: 'Full module names', detail: `${shorts} task(s) use a short module name. The full name (ansible.builtin.x) avoids clashes.` });
+  }
+
+  function checkAnsibleYaml(file, files, out) {
+    const { value, errors } = parseYaml(textOf(file));
+    for (const e of errors) out.push({ file: file.path, level: 'error', name: 'YAML syntax', detail: e.msg, line: e.line });
+    if (!errors.length) out.push({ file: file.path, level: 'pass', name: 'YAML syntax', detail: 'The file reads as valid YAML.' });
+    if (errors.length || value === null) return { parsed: null };
+
+    const ctx = { tasks: [], notified: [], registered: new Set() };
+    const info = { plays: [], taskFile: null };
+
+    // A role's defaults/vars file is a plain map.
+    if (isObj(value) && /(defaults|vars)\/main\.ya?ml$/.test(file.path)) {
+      out.push({ file: file.path, level: 'pass', name: 'Variables read', detail: `${Object.keys(value).length} variable(s) defined.` });
+      return { parsed: value, kind: 'vars' };
+    }
+    if (isObj(value) && /meta\/main\.ya?ml$/.test(file.path)) {
+      out.push({ file: file.path, level: value.galaxy_info ? 'pass' : 'warn', name: 'Role metadata', detail: value.galaxy_info ? 'galaxy_info is present.' : 'galaxy_info is missing.' });
+      return { parsed: value, kind: 'meta' };
+    }
+    if (!isArr(value)) return { parsed: value, kind: 'map' };
+
+    const isPlays = value.length && value.every((x) => isObj(x) && ('hosts' in x || 'import_playbook' in x || 'tasks' in x || 'roles' in x || 'pre_tasks' in x || 'post_tasks' in x));
+    if (isPlays) {
+      for (const play of value) {
+        const n = lineOf(play);
+        if (!play.hosts && !play.import_playbook) out.push({ file: file.path, level: 'error', name: 'Play has hosts', detail: 'A play needs "hosts:" so Ansible knows where to run.', line: n });
+        else out.push({ file: file.path, level: 'pass', name: 'Play has hosts', detail: `"${play.name || play.hosts}" runs on ${play.hosts}.`, line: n });
+        const tasks = play.tasks || [];
+        const pre = play.pre_tasks || [];
+        const post = play.post_tasks || [];
+        if (!tasks.length && !play.roles && !pre.length && !post.length) out.push({ file: file.path, level: 'warn', name: 'Play does something', detail: 'This play has no tasks and no roles.', line: n });
+        if (isArr(tasks)) checkTasks(file, [...pre, ...tasks, ...post], out, ctx, play);
+        if (play.handlers) {
+          const names = new Set(play.handlers.map((h) => h.name).concat(play.handlers.map((h) => h.listen).filter(Boolean)));
+          for (const nt of ctx.notified) {
+            out.push(names.has(nt.name) ? { file: file.path, level: 'pass', name: 'Handler exists', detail: `"${nt.name}" is defined.`, line: nt.line } : { file: file.path, level: 'error', name: 'Handler exists', detail: `A task notifies "${nt.name}", but no handler has that name.`, line: nt.line });
+          }
+        } else if (ctx.notified.length) {
+          out.push({ file: file.path, level: 'error', name: 'Handler exists', detail: `A task notifies "${ctx.notified[0].name}", but the play has no handlers.`, line: ctx.notified[0].line });
+        }
+        if (play.become !== undefined && play.become !== true && play.become !== false) out.push({ file: file.path, level: 'warn', name: 'become value', detail: 'become should be true or false.', line: n });
+        info.plays.push(play);
+      }
+      if (!ctx.tasks.length) return { parsed: value, kind: 'plays', info };
+    } else if (value.every((x) => isObj(x))) {
+      checkTasks(file, value, out, ctx, null);
+      info.taskFile = value;
+      if (ctx.tasks.length) out.push({ file: file.path, level: 'pass', name: 'Task list', detail: `${ctx.tasks.length} task(s) read.` });
+    } else {
+      out.push({ file: file.path, level: 'error', name: 'Playbook shape', detail: 'A playbook is a list of plays; a role file is a list of tasks. This is neither.' });
+    }
+
+    // Variables used with {{ }} but never defined (only judged when we can see the role's defaults).
+    const defaults = files.find((f) => /defaults\/main\.ya?ml$/.test(f.path));
+    if (defaults && info.taskFile) {
+      const known = new Set(Object.keys(parseYaml(textOf(defaults)).value || {}));
+      for (const r of ctx.registered) known.add(r);
+      const used = new Map();
+      for (const m of textOf(file).matchAll(/\{\{\s*([A-Za-z_]\w*)/g)) if (!used.has(m[1])) used.set(m[1], 1);
+      const magic = /^(item|ansible_.*|inventory_hostname.*|hostvars|groups|group_names|play_hosts|role_path|playbook_dir|omit|lookup|ansible_facts)$/;
+      const missing = [...used.keys()].filter((v) => !known.has(v) && !magic.test(v));
+      out.push(missing.length ? { file: file.path, level: 'warn', name: 'Variables are defined', detail: `Used but not in defaults/main.yml: ${missing.join(', ')}.` } : { file: file.path, level: 'pass', name: 'Variables are defined', detail: `Every {{ variable }} is defined in defaults/main.yml (${used.size} used).` });
+    }
+    return { parsed: value, kind: isPlays ? 'plays' : 'tasks', info };
+  }
+
+  function checkAdhoc(file, out) {
+    const text = textOf(file).replace(/\\\n/g, ' ');
+    const cmd = text.split('\n').find((l) => /^\s*ansible\s/.test(l));
+    if (!cmd) {
+      out.push({ file: file.path, level: 'warn', name: 'Ad-hoc command', detail: 'No line starts with "ansible".' });
+      return null;
+    }
+    const m = cmd.trim().split(/\s+/);
+    const pattern = m[1];
+    const mod = (cmd.match(/-m\s+(\S+)/) || [])[1];
+    const args = (cmd.match(/-a\s+("[^"]*"|'[^']*'|\S+)/) || [])[1];
+    const inv = (cmd.match(/-i\s+(\S+)/) || [])[1];
+    out.push({ file: file.path, level: 'pass', name: 'Command shape', detail: `Runs "${mod || 'command'}" on "${pattern}".` });
+    out.push(inv ? { file: file.path, level: 'pass', name: 'Inventory given', detail: `Uses ${inv}.` } : { file: file.path, level: 'info', name: 'Inventory given', detail: 'No -i, so Ansible uses the inventory in ansible.cfg or /etc/ansible/hosts.' });
+    if (mod && ANSIBLE_MODULES.size && /^ansible\.builtin\./.test(mod) && !ANSIBLE_MODULES.has(mod)) out.push({ file: file.path, level: 'warn', name: 'Module is known', detail: `${mod} is not in Stanza's module list.` });
+    if (/^ansible\.builtin\.(shell|command)$|^(shell|command)$/.test(mod || '') && args && /rm\s+-rf|--no-preserve-root/.test(args)) out.push({ file: file.path, level: 'warn', name: 'Careful command', detail: 'This deletes files on every machine it matches.' });
+    return { pattern, mod: mod || 'ansible.builtin.command', args, inv };
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Terraform
+   * ---------------------------------------------------------------- */
+
+  // Walk the text once, skipping strings and comments, and return top-level blocks.
+  function scanTerraform(text, errors) {
+    const blocks = [];
+    let depth = 0;
+    let line = 1;
+    let i = 0;
+    let headStart = 0;
+    let head = '';
+    let headLine = 1;
+    let bodyStart = -1;
+    const stack = [];
+    const n = text.length;
+    while (i < n) {
+      const c = text[i];
+      if (c === '\n') {
+        line++;
+        if (depth === 0) {
+          headStart = i + 1;
+          headLine = line;
+        }
+        i++;
+        continue;
+      }
+      if (c === '#' || (c === '/' && text[i + 1] === '/')) {
+        while (i < n && text[i] !== '\n') i++;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '*') {
+        const e = text.indexOf('*/', i + 2);
+        const stop = e < 0 ? n : e + 2;
+        for (let k = i; k < stop; k++) if (text[k] === '\n') line++;
+        if (e < 0) errors.push({ line, msg: 'A /* comment is never closed.' });
+        i = stop;
+        continue;
+      }
+      if (c === '<' && text[i + 1] === '<' && /^<<-?[A-Z_]+/.test(text.slice(i, i + 12))) {
+        const tag = text.slice(i).match(/^<<-?([A-Z_]+)/)[1];
+        const re = new RegExp('\\n\\s*' + tag + '\\s*(\\n|$)');
+        const rest = text.slice(i);
+        const m = re.exec(rest);
+        const stop = m ? i + m.index + m[0].length - 1 : n;
+        for (let k = i; k < stop; k++) if (text[k] === '\n') line++;
+        i = stop;
+        continue;
+      }
+      if (c === '"') {
+        const startLine = line;
+        i++;
+        let tmpl = 0;
+        while (i < n) {
+          const d = text[i];
+          if (d === '\n' && !tmpl) {
+            errors.push({ line: startLine, msg: 'A double-quoted string is not closed on its line.' });
+            break;
+          }
+          if (d === '\n') line++;
+          if (d === '\\') {
+            i += 2;
+            continue;
+          }
+          if (d === '$' && text[i + 1] === '{') {
+            tmpl++;
+            i += 2;
+            continue;
+          }
+          if (d === '}' && tmpl) {
+            tmpl--;
+            i++;
+            continue;
+          }
+          if (d === '"' && !tmpl) break;
+          i++;
+        }
+        i++;
+        continue;
+      }
+      if (c === '{' || c === '[' || c === '(') {
+        if (c === '{' && depth === 0) {
+          head = text.slice(headStart, i).trim();
+          bodyStart = i + 1;
+        }
+        stack.push({ c, line });
+        if (c === '{') depth++;
+        i++;
+        continue;
+      }
+      if (c === '}' || c === ']' || c === ')') {
+        const open = stack.pop();
+        const want = { '}': '{', ']': '[', ')': '(' }[c];
+        if (!open) errors.push({ line, msg: `A "${c}" closes something that was never opened.` });
+        else if (open.c !== want) errors.push({ line, msg: `A "${c}" does not match the "${open.c}" opened on line ${open.line}.` });
+        if (c === '}') {
+          depth--;
+          if (depth === 0 && bodyStart >= 0) {
+            blocks.push({ head, line: headLine, endLine: line, body: text.slice(bodyStart, i), bodyLine: headLine });
+            bodyStart = -1;
+            headStart = i + 1;
+          }
+        }
+        i++;
+        continue;
+      }
+      i++;
+    }
+    for (const o of stack) errors.push({ line: o.line, msg: `A "${o.c}" is opened here and never closed.` });
+    return blocks;
+  }
+
+  // Top-level "name = value" lines inside a block body.
+  function attrsOf(body) {
+    const attrs = {};
+    let depth = 0;
+    for (const raw of body.split('\n')) {
+      const s = raw.replace(/#.*$/, '');
+      if (depth === 0) {
+        const m = s.match(/^\s*([A-Za-z_][\w-]*)\s*=\s*(.*)$/);
+        if (m) attrs[m[1]] = m[2].trim();
+      }
+      const clean = s.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+      for (const ch of clean) {
+        if (ch === '{' || ch === '[' || ch === '(') depth++;
+        else if (ch === '}' || ch === ']' || ch === ')') depth--;
+      }
+    }
+    return attrs;
+  }
+
+  const TF_BLOCKS = new Set(['terraform', 'provider', 'resource', 'data', 'variable', 'output', 'locals', 'module', 'moved', 'import', 'removed', 'check']);
+  const TF_NEEDS = {
+    aws_instance: ['ami', 'instance_type'],
+    aws_vpc: ['cidr_block'],
+    aws_subnet: ['vpc_id', 'cidr_block'],
+    aws_s3_bucket_versioning: ['bucket', 'versioning_configuration'],
+    aws_s3_bucket_public_access_block: ['bucket'],
+    aws_s3_bucket_server_side_encryption_configuration: ['bucket', 'rule'],
+    aws_vpc_security_group_ingress_rule: ['security_group_id', 'ip_protocol'],
+    aws_vpc_security_group_egress_rule: ['security_group_id', 'ip_protocol'],
+  };
+
+  function parseTf(files) {
+    const all = { resources: [], datas: [], variables: [], outputs: [], providers: [], terraform: null, locals: new Set() };
+    const checks = [];
+    for (const f of files) {
+      const errors = [];
+      const text = textOf(f);
+      const blocks = scanTerraform(text, errors);
+      for (const e of errors) checks.push({ file: f.path, level: 'error', name: 'Braces and quotes', detail: e.msg, line: e.line });
+      if (!errors.length) checks.push({ file: f.path, level: 'pass', name: 'Braces and quotes', detail: `Balanced. ${blocks.length} block(s) read.` });
+      for (const b of blocks) {
+        const m = b.head.match(/^([A-Za-z_]\w*)((?:\s+"[^"]*")*)\s*$/);
+        if (!m) {
+          checks.push({ file: f.path, level: 'error', name: 'Block header', detail: `"${b.head.slice(0, 50)}" is not a valid block header.`, line: b.line });
+          continue;
+        }
+        const type = m[1];
+        const labels = [...m[2].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+        if (!TF_BLOCKS.has(type)) {
+          checks.push({ file: f.path, level: 'error', name: 'Block type', detail: `"${type}" is not a Terraform block type.`, line: b.line });
+          continue;
+        }
+        const want = { resource: 2, data: 2, variable: 1, output: 1, provider: 1, module: 1, terraform: 0, locals: 0 }[type];
+        if (want !== undefined && labels.length !== want) {
+          checks.push({ file: f.path, level: 'error', name: 'Block labels', detail: `A ${type} block needs ${want} name(s) in quotes, found ${labels.length}.`, line: b.line });
+          continue;
+        }
+        const blk = { type, labels, file: f.path, line: b.line, endLine: b.endLine, body: b.body, attrs: attrsOf(b.body) };
+        if (type === 'resource') all.resources.push(blk);
+        else if (type === 'data') all.datas.push(blk);
+        else if (type === 'variable') all.variables.push(blk);
+        else if (type === 'output') all.outputs.push(blk);
+        else if (type === 'provider') all.providers.push(blk);
+        else if (type === 'terraform') all.terraform = blk;
+        else if (type === 'locals') for (const k of Object.keys(blk.attrs)) all.locals.add(k);
+      }
+    }
+    return { all, checks };
+  }
+
+  function checkTerraform(files, out) {
+    const tf = files.filter((f) => /\.tf$/.test(f.path));
+    if (!tf.length) return null;
+    const { all, checks } = parseTf(tf);
+    out.push(...checks);
+    const text = tf.map(textOf).join('\n');
+    const stripped = text.replace(/#.*$/gm, '').replace(/\/\/.*$/gm, '');
+
+    for (const r of all.resources) {
+      const need = TF_NEEDS[r.labels[0]];
+      if (need) {
+        const miss = need.filter((k) => !(k in r.attrs) && !new RegExp('^\\s*' + k + '\\s*\\{', 'm').test(r.body));
+        out.push(miss.length ? { file: r.file, level: 'error', name: 'Required arguments', detail: `${r.labels.join('.')} is missing: ${miss.join(', ')}.`, line: r.line } : { file: r.file, level: 'pass', name: 'Required arguments', detail: `${r.labels.join('.')} has what it needs.`, line: r.line });
+      }
+    }
+
+    const declared = new Set(all.variables.map((v) => v.labels[0]));
+    const usedVars = new Set([...stripped.matchAll(/\bvar\.([A-Za-z_]\w*)/g)].map((m) => m[1]));
+    const missingVars = [...usedVars].filter((v) => !declared.has(v));
+    if (usedVars.size) {
+      out.push(missingVars.length ? { file: tf[0].path, level: 'warn', name: 'Variables declared', detail: `Used but not declared in these files: ${missingVars.join(', ')}. They come from variables.tf; keep it in the same folder.` } : { file: tf[0].path, level: 'pass', name: 'Variables declared', detail: `All ${usedVars.size} variable(s) used are declared.` });
+    }
+    const unused = [...declared].filter((v) => !usedVars.has(v) && !/\.tfvars/.test(v));
+    if (unused.length && all.resources.length) out.push({ file: tf[0].path, level: 'info', name: 'Variables used', detail: `Declared but unused here: ${unused.join(', ')}. Another file may use them.` });
+    const noDesc = all.variables.filter((v) => !/description\s*=/.test(v.body));
+    if (all.variables.length) out.push(noDesc.length ? { file: noDesc[0].file, level: 'info', name: 'Variables described', detail: `${noDesc.length} variable(s) have no description.`, line: noDesc[0].line } : { file: all.variables[0].file, level: 'pass', name: 'Variables described', detail: 'Every variable has a description.' });
+
+    // References to other resources must exist, somewhere.
+    const have = new Set(all.resources.map((r) => r.labels.join('.')));
+    const haveData = new Set(all.datas.map((r) => r.labels.join('.')));
+    const refs = new Set();
+    for (const m of stripped.matchAll(/\b(?:data\.)?([a-z][a-z0-9]*_[a-z0-9_]+)\.([A-Za-z_][\w-]*)/g)) {
+      const key = `${m[1]}.${m[2]}`;
+      if (/^(aws|random|tls|null|local|http|time|archive|template)_/.test(m[1])) refs.add(m[0].startsWith('data.') ? 'data.' + key : key);
+    }
+    const unresolved = [...refs].filter((r) => (r.startsWith('data.') ? !haveData.has(r.slice(5)) : !have.has(r)));
+    if (refs.size) {
+      out.push(unresolved.length ? { file: tf[0].path, level: 'info', name: 'References resolve', detail: `Points at ${unresolved.join(', ')}, which is not in these files. It must exist in another .tf file of your project (for example from another generator).` } : { file: tf[0].path, level: 'pass', name: 'References resolve', detail: `${refs.size} reference(s) to other resources all resolve.` });
+    }
+
+    // Safety checks
+    if (/\bAKIA[0-9A-Z]{16}\b/.test(text) || /(access_key|secret_key)\s*=\s*"[^"$]{8,}"/.test(text)) out.push({ file: tf[0].path, level: 'error', name: 'No keys in the code', detail: 'An AWS key is written in the file. Remove it and use environment variables or a profile.' });
+    else if (all.providers.some((p) => p.labels[0] === 'aws')) out.push({ file: all.providers[0].file, level: 'pass', name: 'No keys in the code', detail: 'No AWS keys are written in the files.' });
+    for (const r of all.resources) {
+      if (r.labels[0] === 'aws_security_group' || r.labels[0] === 'aws_vpc_security_group_ingress_rule' || r.labels[0] === 'aws_security_group_rule') {
+        const open = /0\.0\.0\.0\/0/.test(r.body);
+        const ssh = /(from_port|to_port)\s*=\s*22\b/.test(r.body);
+        if (open && ssh) out.push({ file: r.file, level: 'warn', name: 'SSH is not open to the world', detail: `${r.labels.join('.')} allows port 22 from 0.0.0.0/0. Limit it to your own IP address.`, line: r.line });
+        else if (open) out.push({ file: r.file, level: 'info', name: 'Open to the internet', detail: `${r.labels.join('.')} allows 0.0.0.0/0 on some port. Fine for a public web server, risky for anything else.`, line: r.line });
+      }
+      if (r.labels[0] === 'aws_instance') {
+        out.push(/http_tokens\s*=\s*"required"/.test(r.body) ? { file: r.file, level: 'pass', name: 'Instance metadata v2', detail: 'IMDSv2 is required, which blocks a common credential-theft trick.', line: r.line } : { file: r.file, level: 'warn', name: 'Instance metadata v2', detail: 'Add metadata_options { http_tokens = "required" }.', line: r.line });
+        if (/root_block_device/.test(r.body)) out.push(/encrypted\s*=\s*true/.test(r.body) ? { file: r.file, level: 'pass', name: 'Disk encrypted', detail: 'The root disk is encrypted.', line: r.line } : { file: r.file, level: 'warn', name: 'Disk encrypted', detail: 'Set encrypted = true on the root disk.', line: r.line });
+      }
+      if (r.labels[0] === 'aws_s3_bucket') {
+        const name = r.labels[1];
+        const hasPab = all.resources.some((x) => x.labels[0] === 'aws_s3_bucket_public_access_block' && x.body.includes(`aws_s3_bucket.${name}`));
+        out.push(hasPab ? { file: r.file, level: 'pass', name: 'Bucket is private', detail: `${r.labels.join('.')} has a public access block.`, line: r.line } : { file: r.file, level: 'warn', name: 'Bucket is private', detail: `${r.labels.join('.')} has no public access block next to it.`, line: r.line });
+      }
+    }
+    if (all.providers.some((p) => p.labels[0] === 'aws') && !all.terraform) out.push({ file: all.providers[0].file, level: 'warn', name: 'Versions pinned', detail: 'No terraform { required_providers } block, so provider versions can change under you.' });
+    else if (all.terraform) out.push(/required_providers/.test(all.terraform.body) ? { file: all.terraform.file, level: 'pass', name: 'Versions pinned', detail: 'The provider version is pinned.', line: all.terraform.line } : { file: all.terraform.file, level: 'warn', name: 'Versions pinned', detail: 'No required_providers block.', line: all.terraform.line });
+    return all;
+  }
+
+  function checkTfvars(file, out) {
+    const bad = textOf(file).split('\n').map((l, i) => [l, i + 1]).filter(([l]) => /^\s*[\w-]+\s*=/.test(l) && SECRET_NAME.test(l.split('=')[0]) && !/=\s*(""|"\$\{)/.test(l));
+    out.push(bad.length ? { file: file.path, level: 'error', name: 'No secrets in tfvars', detail: `"${bad[0][0].split('=')[0].trim()}" looks like a secret. tfvars files usually end up in git.`, line: bad[0][1] } : { file: file.path, level: 'pass', name: 'No secrets in tfvars', detail: 'Only ordinary settings are in this file.' });
+  }
+
+  function checkGitignore(file, files, out) {
+    const t = textOf(file);
+    if (files.some((f) => /\.tf$/.test(f.path))) {
+      out.push(/\.tfstate/.test(t) ? { file: file.path, level: 'pass', name: 'State files ignored', detail: 'terraform.tfstate is kept out of git. It can contain secrets.' } : { file: file.path, level: 'error', name: 'State files ignored', detail: 'Add *.tfstate. State files can hold passwords and keys.' });
+    }
+    if (files.some((f) => base(f.path) === '.env.example')) out.push(/^\.env$/m.test(t) ? { file: file.path, level: 'pass', name: '.env is ignored', detail: 'Your real .env will not be committed.' } : { file: file.path, level: 'error', name: '.env is ignored', detail: 'Add a line ".env" so the real secrets are never committed.' });
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Jenkins: Jenkinsfile, shared library, setup files, agent script
+   * ---------------------------------------------------------------- */
+
+  // A tiny Groovy reader: finds { } blocks, skipping strings and comments.
+  function groovyTree(text, errors) {
+    const root = { head: '', line: 1, children: [], body: '' };
+    const stack = [root];
+    const pairs = [];
+    let line = 1;
+    let i = 0;
+    let stmtStart = 0;
+    const n = text.length;
+    const top = () => stack[stack.length - 1];
+    while (i < n) {
+      const c = text[i];
+      if (c === '\n') {
+        line++;
+        if (stack.length === 1 || true) stmtStart = i + 1;
+        i++;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '/') {
+        while (i < n && text[i] !== '\n') i++;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '*') {
+        const e = text.indexOf('*/', i + 2);
+        const stop = e < 0 ? n : e + 2;
+        for (let k = i; k < stop; k++) if (text[k] === '\n') line++;
+        if (e < 0) errors.push({ line, msg: 'A /* comment is never closed.' });
+        i = stop;
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        const triple = text.substr(i, 3) === c.repeat(3);
+        const q = triple ? c.repeat(3) : c;
+        const startLine = line;
+        i += q.length;
+        let closed = false;
+        let tmpl = 0;
+        while (i < n) {
+          if (text[i] === '\\') {
+            i += 2;
+            continue;
+          }
+          if (text[i] === '\n') {
+            line++;
+            if (!triple && !tmpl) break;
+          }
+          if (c === '"' && text[i] === '$' && text[i + 1] === '{') {
+            tmpl++;
+            i += 2;
+            continue;
+          }
+          if (c === '"' && text[i] === '}' && tmpl) {
+            tmpl--;
+            i++;
+            continue;
+          }
+          if (!tmpl && text.substr(i, q.length) === q) {
+            closed = true;
+            i += q.length;
+            break;
+          }
+          i++;
+        }
+        if (!closed) errors.push({ line: startLine, msg: `A ${q} string is not closed.` });
+        continue;
+      }
+      if (c === '{') {
+        const head = text.slice(stmtStart, i).replace(/\/\/.*$/gm, '').trim();
+        const node = { head, line, children: [], body: '', start: i + 1 };
+        top().children.push(node);
+        stack.push(node);
+        pairs.push({ c, line });
+        i++;
+        stmtStart = i;
+        continue;
+      }
+      if (c === '}') {
+        const open = pairs.pop();
+        if (!open || open.c !== '{') {
+          errors.push({ line, msg: 'A "}" closes a block that was never opened.' });
+          if (open) pairs.push(open);
+        } else {
+          const node = stack.pop();
+          node.body = text.slice(node.start, i);
+          node.endLine = line;
+        }
+        i++;
+        stmtStart = i;
+        continue;
+      }
+      if (c === '(' || c === '[') pairs.push({ c, line });
+      if (c === ')' || c === ']') {
+        const want = c === ')' ? '(' : '[';
+        const open = pairs.pop();
+        if (!open) errors.push({ line, msg: `A "${c}" has no matching "${want}".` });
+        else if (open.c !== want) errors.push({ line, msg: `A "${c}" does not match the "${open.c}" opened on line ${open.line}.` });
+      }
+      if (c === ';') stmtStart = i + 1;
+      i++;
+    }
+    for (const o of pairs) errors.push({ line: o.line, msg: `A "${o.c}" is opened here and never closed.` });
+    return root;
+  }
+
+  const child = (node, re) => node.children.filter((c) => re.test(c.head));
+  // The text of a block with its nested { } blocks cut out, so only its own lines are left.
+  function ownText(node) {
+    let s = node.body;
+    for (const c of [...node.children].reverse()) {
+      const a = c.start - node.start;
+      s = s.slice(0, a) + s.slice(a + c.body.length);
+    }
+    return s;
+  }
+  const stageName = (node) => (node.head.match(/^stage\s*\(\s*(['"])(.*?)\1\s*\)/) || [])[2];
+
+  function stageList(node) {
+    const out = [];
+    for (const st of child(node, /^stages$/)) for (const s of child(st, /^stage\s*\(/)) out.push(s);
+    return out;
+  }
+
+  function checkJenkinsfile(file, out) {
+    const text = textOf(file);
+    const errors = [];
+    const tree = groovyTree(text, errors);
+    for (const e of errors) out.push({ file: file.path, level: 'error', name: 'Brackets and quotes', detail: e.msg, line: e.line });
+    if (!errors.length) out.push({ file: file.path, level: 'pass', name: 'Brackets and quotes', detail: 'Every { ( [ and quote is closed.' });
+    if (errors.length) return null;
+
+    const pipes = child(tree, /^pipeline$/);
+    if (!pipes.length) {
+      if (/@Library/.test(text)) {
+        out.push({ file: file.path, level: 'pass', name: 'Shared library call', detail: 'This file loads a library and calls its step.' });
+        return { tree, lib: true, text };
+      }
+      out.push({ file: file.path, level: 'error', name: 'Has a pipeline', detail: 'No "pipeline { }" block was found.' });
+      return null;
+    }
+    const pipe = pipes[0];
+    out.push({ file: file.path, level: 'pass', name: 'Has a pipeline', detail: 'Found pipeline { }.', line: pipe.line });
+
+    const stages = stageList(pipe);
+    out.push(stages.length ? { file: file.path, level: 'pass', name: 'Has stages', detail: `${stages.length} stage(s): ${stages.map(stageName).join(', ')}.` } : { file: file.path, level: 'error', name: 'Has stages', detail: 'A pipeline needs a stages { } block with at least one stage.' });
+
+    const pipeAgent = child(pipe, /^agent\b/).length || /^\s*agent\s+(any|none)\b/m.test(ownText(pipe));
+    const allStagesHaveAgent = stages.length && stages.every((s) => child(s, /^agent\b/).length || /^\s*agent\s/m.test(ownText(s)) || child(s, /^matrix$/).length);
+    out.push(pipeAgent || allStagesHaveAgent ? { file: file.path, level: 'pass', name: 'Has an agent', detail: 'Jenkins knows where to run.' } : { file: file.path, level: 'error', name: 'Has an agent', detail: 'Add "agent any" (or an agent in every stage).' });
+
+    const names = stages.map(stageName);
+    const dup = names.find((x, i) => names.indexOf(x) !== i);
+    if (dup) out.push({ file: file.path, level: 'error', name: 'Stage names are unique', detail: `Two stages are called "${dup}".` });
+    for (const s of stages) {
+      const has = child(s, /^(steps|stages|parallel|matrix)$/).length;
+      if (!has) out.push({ file: file.path, level: 'error', name: 'Stage has steps', detail: `Stage "${stageName(s)}" has no steps { }.`, line: s.line });
+    }
+
+    // Secrets
+    const sh = [...text.matchAll(/^\s*sh\s+"(.*)"\s*$/gm)];
+    const leaky = sh.filter((m) => /\$\{?[A-Za-z_]*(PASS|TOKEN|SECRET|KEY|CRED)[A-Za-z_]*\}?/i.test(m[1]));
+    out.push(leaky.length ? { file: file.path, level: 'warn', name: 'Secrets stay out of Groovy strings', detail: 'A secret is put into a double-quoted sh string, so Groovy (not the shell) expands it. Use single quotes so the shell does it.' } : { file: file.path, level: 'pass', name: 'Secrets stay out of Groovy strings', detail: 'No secret is expanded inside a double-quoted sh string.' });
+    const hard = text.split('\n').map((l, i) => [l, i + 1]).find(([l]) => /(password|token|secret|apikey)\s*[=:]\s*['"][^'"$]{6,}['"]/i.test(l) && !/credentialsId|usernameVariable|passwordVariable|credentials\(/i.test(l));
+    out.push(hard ? { file: file.path, level: 'error', name: 'No secrets written in', detail: 'A password or token is written in the Jenkinsfile. Store it in Jenkins credentials.', line: hard[1] } : { file: file.path, level: 'pass', name: 'No secrets written in', detail: 'No password or token is typed into the file.' });
+
+    // input must not hold an executor
+    const inputs = [...text.matchAll(/\binput\s+(message|\()/g)];
+    if (inputs.length) {
+      const noTimeout = !/timeout\s*\([^)]*\)\s*\{[^}]*input\b/s.test(text);
+      out.push(noTimeout ? { file: file.path, level: 'warn', name: 'Approval has a time limit', detail: 'An input step waits forever. Wrap it in timeout(time: 1, unit: \'HOURS\') { }.' } : { file: file.path, level: 'pass', name: 'Approval has a time limit', detail: 'The approval step gives up after a set time.' });
+    }
+    out.push(/timeout\s*\(/.test(text) ? { file: file.path, level: 'pass', name: 'Run has a time limit', detail: 'A timeout is set.' } : { file: file.path, level: 'info', name: 'Run has a time limit', detail: 'No timeout. A stuck build would run until someone stops it.' });
+
+    // What to prepare in Jenkins
+    const needs = new Set();
+    const plugins = new Set(['workflow-aggregator (Pipeline)']);
+    const rules = [
+      [/docker\s*\{|dockerfile/i, 'docker-workflow (Docker Pipeline)'],
+      [/\bjunit\b/, 'junit'],
+      [/\bsshagent\b/, 'ssh-agent'],
+      [/withCredentials|credentials\(/, 'credentials-binding'],
+      [/\bcleanWs\b/, 'ws-cleanup'],
+      [/timestamps\(\)/, 'timestamper'],
+      [/changeRequest\(\)|buildingTag\(\)|\btag\s+['"]|branch\s+['"]/, 'a multibranch job (github-branch-source for GitHub)'],
+    ];
+    for (const [re, p] of rules) if (re.test(text)) plugins.add(p);
+    for (const m of text.matchAll(/credentialsId\s*:\s*['"]([^'"]+)['"]|credentials\(\s*['"]([^'"]+)['"]\s*\)|usernamePassword\([^)]*credentialsId:\s*['"]([^'"]+)['"]|sshUserPrivateKey\([^)]*credentialsId:\s*['"]([^'"]+)['"]|string\([^)]*credentialsId:\s*['"]([^'"]+)['"]/g)) needs.add(m[1] || m[2] || m[3] || m[4] || m[5]);
+    for (const m of text.matchAll(/sshagent\s*\(\s*(?:credentials\s*:\s*)?\[\s*['"]([^'"]+)['"]/g)) needs.add(m[1]);
+    out.push({ file: file.path, level: 'info', name: 'Plugins needed', detail: [...plugins].join(', ') + '.' });
+    if (needs.size) out.push({ file: file.path, level: 'info', name: 'Credentials to create', detail: `Create these in Manage Jenkins > Credentials before the first run: ${[...needs].join(', ')}.` });
+    return { tree, pipe, stages, text };
+  }
+
+  function checkGroovyLib(file, out) {
+    const errors = [];
+    groovyTree(textOf(file), errors);
+    for (const e of errors) out.push({ file: file.path, level: 'error', name: 'Brackets and quotes', detail: e.msg, line: e.line });
+    if (!errors.length) out.push({ file: file.path, level: 'pass', name: 'Brackets and quotes', detail: 'Every { ( [ and quote is closed.' });
+    out.push(/def\s+call\s*\(/.test(textOf(file)) ? { file: file.path, level: 'pass', name: 'Has call()', detail: 'The step has a call method, which Jenkins runs.' } : { file: file.path, level: 'error', name: 'Has call()', detail: 'A vars/ step needs "def call(...) { }".' });
+    const stepName = base(file.path).replace(/\.groovy$/, '');
+    out.push(/^[a-z][A-Za-z0-9]*$/.test(stepName) ? { file: file.path, level: 'pass', name: 'Step name', detail: `The step is called ${stepName}.` } : { file: file.path, level: 'warn', name: 'Step name', detail: 'Use camelCase, starting with a lowercase letter.' });
+  }
+
+  function checkShell(file, out) {
+    const t = textOf(file);
+    const lines = t.split('\n');
+    out.push(/^#!\/(usr\/)?bin\/(env )?(ba)?sh/.test(lines[0]) ? { file: file.path, level: 'pass', name: 'Has a shebang', detail: 'The first line names the interpreter.' } : { file: file.path, level: 'warn', name: 'Has a shebang', detail: 'Start the script with #!/usr/bin/env bash.' });
+    out.push(/^set\s+-[a-z]*e[a-z]*u|set -euo pipefail|set -e/m.test(t) ? { file: file.path, level: 'pass', name: 'Stops on errors', detail: 'set -e is on, so a failed step stops the script.' } : { file: file.path, level: 'warn', name: 'Stops on errors', detail: 'Add "set -euo pipefail" near the top.' });
+    const badQuote = lines.map((l, i) => [l.replace(/\\./g, '').replace(/'[^']*'/g, "''"), i + 1]).find(([l]) => !/^\s*#/.test(l) && ((l.match(/"/g) || []).length % 2 === 1) && !/\\$/.test(l));
+    out.push(badQuote ? { file: file.path, level: 'error', name: 'Quotes are closed', detail: 'A double quote is opened and not closed on this line.', line: badQuote[1] } : { file: file.path, level: 'pass', name: 'Quotes are closed', detail: 'Every quote is paired.' });
+    if (/curl[^|\n]*\|\s*(sudo\s+)?(ba)?sh/.test(t)) out.push({ file: file.path, level: 'warn', name: 'No pipe to shell', detail: 'curl ... | sh runs code you have not read.' });
+    if (/chmod\s+(-R\s+)?777/.test(t)) out.push({ file: file.path, level: 'error', name: 'Sensible permissions', detail: 'chmod 777 lets everyone change the file.' });
+    if (/ssh-(ed25519|rsa)\s+[A-Za-z0-9+/=]{20,}/.test(t) && /PRIVATE KEY/.test(t)) out.push({ file: file.path, level: 'error', name: 'No private keys', detail: 'A private key is written in the script.' });
+    else if (/PUBLIC_KEY=/.test(t)) out.push({ file: file.path, level: 'pass', name: 'Only a public key', detail: 'Only the public half of the key is in the script, which is safe.' });
+  }
+
+  function checkDockerfile(file, files, out) {
+    const lines = textOf(file).split('\n').filter((l) => l.trim() && !/^\s*#/.test(l));
+    out.push(/^FROM\s/i.test(lines[0] || '') ? { file: file.path, level: 'pass', name: 'Starts with FROM', detail: lines[0].trim() } : { file: file.path, level: 'error', name: 'Starts with FROM', detail: 'A Dockerfile must start with FROM.' });
+    const from = (lines[0] || '').match(/^FROM\s+(\S+)/i);
+    if (from) out.push(/:latest$|^[^:]+$/.test(from[1]) ? { file: file.path, level: 'warn', name: 'Image is pinned', detail: `${from[1]} has no fixed version tag.` } : { file: file.path, level: 'pass', name: 'Image is pinned', detail: `Uses a tagged image (${from[1]}).` });
+    const users = lines.filter((l) => /^USER\s/i.test(l));
+    const last = users[users.length - 1];
+    out.push(last && !/root/i.test(last) ? { file: file.path, level: 'pass', name: 'Runs as a normal user', detail: `The last USER is ${last.replace(/^USER\s+/i, '')}.` } : { file: file.path, level: 'warn', name: 'Runs as a normal user', detail: 'End the file with USER set to a non-root user.' });
+    for (const l of lines) {
+      const m = l.match(/^COPY\s+(?:--\S+\s+)*(\S+)\s+\S+/i);
+      if (m && !m[1].startsWith('--') && !files.some((f) => f.path === m[1] || base(f.path) === base(m[1]))) {
+        out.push({ file: file.path, level: 'warn', name: 'COPY source exists', detail: `${m[1]} is copied in, but is not among these files.` });
+      } else if (m) out.push({ file: file.path, level: 'pass', name: 'COPY source exists', detail: `${m[1]} is in the build.` });
+    }
+    if (/apt-get install(?![^\n]*-y)/.test(textOf(file).replace(/\\\n/g, ' '))) out.push({ file: file.path, level: 'warn', name: 'apt-get has -y', detail: 'apt-get install without -y stops and waits for a keypress during a build.' });
+  }
+
+  function checkPlugins(file, out) {
+    const lines = textOf(file).split('\n').map((l, i) => [l.replace(/#.*$/, '').trim(), i + 1]).filter(([l]) => l);
+    const seen = new Set();
+    let bad = null;
+    let dup = null;
+    for (const [l, n] of lines) {
+      if (!/^[a-z0-9][a-z0-9-]*(:[\w.-]+)?$/.test(l)) bad = bad || [l, n];
+      const id = l.split(':')[0];
+      if (seen.has(id)) dup = dup || [id, n];
+      seen.add(id);
+    }
+    out.push(bad ? { file: file.path, level: 'error', name: 'Plugin ids', detail: `"${bad[0]}" is not a plugin id. Use lowercase names such as git or git:5.7.0.`, line: bad[1] } : { file: file.path, level: 'pass', name: 'Plugin ids', detail: `${lines.length} plugin id(s) are well formed.` });
+    if (dup) out.push({ file: file.path, level: 'warn', name: 'No duplicates', detail: `${dup[0]} is listed twice.`, line: dup[1] });
+    const pinned = lines.filter(([l]) => l.includes(':')).length;
+    out.push({ file: file.path, level: 'info', name: 'Versions', detail: pinned ? `${pinned} of ${lines.length} are pinned.` : 'None are pinned, so a rebuild installs the newest versions. Fine for learning; pin them for a real server.' });
+    let known = null;
+    try {
+      known = new Set((typeof JK_PLUGIN_GROUPS !== 'undefined' ? JK_PLUGIN_GROUPS : require('./jk-ref2.js').JK_PLUGIN_GROUPS).flatMap((g) => g.commands.map((c) => c.cmd.split(/\s/)[0])));
+    } catch (e) {
+      /* optional */
+    }
+    if (known && known.size) {
+      const unk = [...seen].filter((p) => !known.has(p));
+      if (unk.length) out.push({ file: file.path, level: 'info', name: 'Known ids', detail: `Not in Stanza's plugin list (may still be real): ${unk.join(', ')}.` });
+    }
+  }
+
+  function envVarsIn(text) {
+    return [...text.matchAll(/\$\{([A-Z][A-Z0-9_]*)\}/g)].map((m) => m[1]);
+  }
+
+  function checkCompose(file, files, out) {
+    const { value, errors } = parseYaml(textOf(file));
+    for (const e of errors) out.push({ file: file.path, level: 'error', name: 'YAML syntax', detail: e.msg, line: e.line });
+    if (!errors.length) out.push({ file: file.path, level: 'pass', name: 'YAML syntax', detail: 'The file reads as valid YAML.' });
+    if (errors.length || !isObj(value) || !isObj(value.services)) {
+      if (!errors.length) out.push({ file: file.path, level: 'error', name: 'Has services', detail: 'A compose file needs a top-level "services:" map.' });
+      return null;
+    }
+    const svcs = value.services;
+    out.push({ file: file.path, level: 'pass', name: 'Has services', detail: `${Object.keys(svcs).length} service(s): ${Object.keys(svcs).join(', ')}.` });
+    const namedVols = new Set(Object.keys(value.volumes || {}));
+    for (const [name, s] of Object.entries(svcs)) {
+      if (!s.image && !s.build) out.push({ file: file.path, level: 'error', name: 'Service has an image', detail: `${name} needs "image:" or "build:".`, line: lineOf(s) });
+      for (const p of s.ports || []) {
+        if (typeof p !== 'string') out.push({ file: file.path, level: 'warn', name: 'Ports are quoted', detail: `${name}: write ports as "8080:8080" in quotes. YAML can misread some unquoted pairs.`, line: lineOf(s) });
+      }
+      for (const v of s.volumes || []) {
+        const src = String(v).split(':')[0];
+        if (/^[a-z_][\w-]*$/i.test(src) && !namedVols.has(src)) out.push({ file: file.path, level: 'error', name: 'Volume is declared', detail: `${name} uses the volume "${src}", but it is not listed under volumes:.`, line: lineOf(s) });
+        if (/docker\.sock/.test(String(v))) out.push({ file: file.path, level: 'warn', name: 'Docker socket shared', detail: `${name} can control the host's Docker, which is nearly root on the host. Use it only on a machine you trust.`, line: lineOf(s) });
+        if (/^\.\/|^\//.test(src) && files.length) {
+          const local = src.replace(/^\.\//, '');
+          if (/^\.\//.test(String(v)) && !files.some((f) => f.path === local)) out.push({ file: file.path, level: 'warn', name: 'Mounted file exists', detail: `${src} is mounted into ${name}, but is not among these files.`, line: lineOf(s) });
+        }
+      }
+      const env = s.environment;
+      const pairs = isObj(env) ? Object.entries(env) : isArr(env) ? env.map((e) => String(e).split(/=(.*)/s).slice(0, 2)) : [];
+      const literal = pairs.find(([k, v]) => SECRET_NAME.test(k) && typeof v === 'string' && !PLACEHOLDER.test(v));
+      out.push(literal ? { file: file.path, level: 'error', name: 'No secrets in compose', detail: `${name}: ${literal[0]} is written in the file. Use \${NAME} and a .env file.`, line: lineOf(s) } : { file: file.path, level: 'pass', name: 'No secrets in compose', detail: `${name}: secrets come from variables, not from the file.` });
+      out.push(s.restart ? { file: file.path, level: 'pass', name: 'Restart policy', detail: `${name} restarts: ${s.restart}.` } : { file: file.path, level: 'info', name: 'Restart policy', detail: `${name} will not restart after a reboot.` });
+    }
+    // Variables like ${X} need a value in .env.example
+    const env = files.find((f) => base(f.path) === '.env.example');
+    const used = [...new Set(envVarsIn(textOf(file)))];
+    if (env && used.length) {
+      const defined = new Set(textOf(env).split('\n').map((l) => (l.match(/^([A-Z][A-Z0-9_]*)=/) || [])[1]).filter(Boolean));
+      const missing = used.filter((v) => !defined.has(v));
+      out.push(missing.length ? { file: file.path, level: 'error', name: '.env has every variable', detail: `${missing.join(', ')} used here but missing from .env.example.` } : { file: file.path, level: 'pass', name: '.env has every variable', detail: `All ${used.length} \${VARIABLE}s have a value line in .env.example.` });
+    }
+    return { value, used };
+  }
+
+  function checkCasc(file, files, out) {
+    const { value, errors } = parseYaml(textOf(file));
+    for (const e of errors) out.push({ file: file.path, level: 'error', name: 'YAML syntax', detail: e.msg, line: e.line });
+    if (!errors.length) out.push({ file: file.path, level: 'pass', name: 'YAML syntax', detail: 'The file reads as valid YAML.' });
+    if (errors.length || !isObj(value)) return null;
+    const known = new Set(['jenkins', 'unclassified', 'credentials', 'security', 'tool', 'jobs', 'appearance', 'globalCredentialsConfiguration']);
+    const odd = Object.keys(value).filter((k) => !known.has(k));
+    out.push(odd.length ? { file: file.path, level: 'warn', name: 'Top-level sections', detail: `Unusual: ${odd.join(', ')}. A plugin may add it; otherwise check the spelling.` } : { file: file.path, level: 'pass', name: 'Top-level sections', detail: `Sections: ${Object.keys(value).join(', ')}.` });
+    const text = textOf(file);
+    const pw = text.split('\n').map((l, i) => [l, i + 1]).find(([l]) => /^\s*(-\s*)?(password|secret|token|privateKey)\s*:\s*"?[^"\s$]+/i.test(l));
+    out.push(pw ? { file: file.path, level: 'error', name: 'No secrets in jenkins.yaml', detail: 'A password is written in the file. Use "${NAME}" and set the value in .env.', line: pw[1] } : { file: file.path, level: 'pass', name: 'No secrets in jenkins.yaml', detail: 'Passwords are read from variables.' });
+    if (/allowAnonymousRead:\s*true/.test(text)) out.push({ file: file.path, level: 'warn', name: 'Anonymous read', detail: 'Anyone can read jobs and logs without logging in.' });
+    else if (/allowAnonymousRead:\s*false/.test(text)) out.push({ file: file.path, level: 'pass', name: 'Anonymous read is off', detail: 'Strangers see nothing.' });
+    if (/allowsSignup:\s*true/.test(text)) out.push({ file: file.path, level: 'warn', name: 'Sign-up is closed', detail: 'Anyone can create an account.' });
+    const compose = files.find((f) => base(f.path) === 'docker-compose.yml');
+    const used = [...new Set(envVarsIn(text))];
+    if (compose && used.length) {
+      const ct = textOf(compose);
+      const missing = used.filter((v) => !new RegExp('\\b' + v + '\\b').test(ct));
+      out.push(missing.length ? { file: file.path, level: 'error', name: 'Variables reach Jenkins', detail: `${missing.join(', ')} used here but not passed to the container in docker-compose.yml.` } : { file: file.path, level: 'pass', name: 'Variables reach Jenkins', detail: `${used.join(', ')} are passed into the container by docker-compose.yml.` });
+    }
+    return value;
+  }
+
+  function checkEnvExample(file, out) {
+    const lines = textOf(file).split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+    const bad = lines.find((l) => !/^[A-Z][A-Z0-9_]*=/.test(l));
+    out.push(bad ? { file: file.path, level: 'error', name: 'NAME=value lines', detail: `"${bad}" is not NAME=value.` } : { file: file.path, level: 'pass', name: 'NAME=value lines', detail: `${lines.length} variable(s).` });
+    const ph = lines.filter((l) => /change-me|your-|paste-|=999$/.test(l)).length;
+    if (ph) out.push({ file: file.path, level: 'info', name: 'Replace placeholders', detail: `${ph} value(s) are placeholders. Copy this file to .env and put real values there.` });
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Dry runs: what the real tool would do
+   * ---------------------------------------------------------------- */
+
+  const line = (t, cls = 'out') => ({ t, cls });
+  const stars = (s) => `${s} ${'*'.repeat(Math.max(3, 62 - s.length))}`;
+
+  function dryAnsiblePlay(play, files, inv, tasksOfRole) {
+    const L = [];
+    const hostsPat = String(play.hosts);
+    let hosts = inv ? inv.hostsOf(hostsPat) : [];
+    let sample = false;
+    if (!hosts.length) {
+      hosts = ['server1', 'server2'];
+      sample = true;
+    }
+    L.push(line(`$ ansible-playbook -i inventory.ini ${'site.yml'} --check --diff`, 'cmd'));
+    L.push(line(''));
+    L.push(line(stars(`PLAY [${play.name || hostsPat}]`), 'head'));
+    L.push(line(`# Ansible picks the machines matching "${hostsPat}"${sample ? ' (no inventory in this build, so two example names are used)' : ''}: ${hosts.join(', ')}.`, 'why'));
+    let ok = 0;
+    let changed = 0;
+    let skipped = 0;
+    const emit = (name, mod, task, tag) => {
+      L.push(line(''));
+      L.push(line(stars(`${tag || 'TASK'} [${name}]`), 'head'));
+      const readOnly = READ_ONLY.has(String(mod).replace(/^ansible\.builtin\./, ''));
+      const cond = task && task.when;
+      for (const h of hosts) {
+        if (cond && /ansible_(os_family|distribution)|ansible_facts/.test(String(isArr(cond) ? cond.join(' ') : cond)) && h === hosts[hosts.length - 1] && hosts.length > 1) {
+          L.push(line(`skipping: [${h}]`, 'skip'));
+          skipped++;
+        } else if (readOnly) {
+          L.push(line(`ok: [${h}]`, 'ok'));
+          ok++;
+        } else {
+          L.push(line(`changed: [${h}]`, 'changed'));
+          changed++;
+        }
+      }
+      if (task && task.when) L.push(line(`# Only runs where: ${isArr(task.when) ? task.when.join(' and ') : task.when}`, 'why'));
+      if (!readOnly) L.push(line(`# "${String(mod).replace('ansible.builtin.', '')}" makes a change the first time. A second run reports ok, because the machine already matches.`, 'why'));
+      else L.push(line(`# "${String(mod).replace('ansible.builtin.', '')}" only looks or reports, so it never changes anything.`, 'why'));
+    };
+    if (play.gather_facts !== false) {
+      L.push(line(''));
+      L.push(line(stars('TASK [Gathering Facts]'), 'head'));
+      for (const h of hosts) L.push(line(`ok: [${h}]`, 'ok'));
+      ok += hosts.length;
+      L.push(line('# Ansible first asks each machine about itself (OS, IP, memory). These facts are what {{ ansible_facts[...] }} reads.', 'why'));
+    }
+    let tasks = [...(play.pre_tasks || []), ...(play.tasks || [])];
+    for (const r of play.roles || []) {
+      const rn = isObj(r) ? r.role || r.name : r;
+      const rt = tasksOfRole(rn);
+      if (rt) tasks = tasks.concat(rt.map((t) => Object.assign({}, t, { __role: rn })));
+    }
+    const flat = [];
+    for (const t of tasks) {
+      if (isObj(t) && isArr(t.block)) flat.push(...t.block);
+      else flat.push(t);
+    }
+    for (const t of flat) {
+      if (!isObj(t)) continue;
+      const mod = moduleOf(t) || 'task';
+      emit((t.__role ? `${t.__role} : ` : '') + (t.name || mod), mod, t);
+    }
+    const handlers = play.handlers || [];
+    const notified = new Set(flat.flatMap((t) => (isObj(t) && t.notify ? (isArr(t.notify) ? t.notify : [t.notify]) : [])));
+    for (const h of handlers) {
+      if (notified.has(h.name)) {
+        emit(h.name, moduleOf(h) || 'handler', h, 'RUNNING HANDLER');
+        L.push(line('# A handler runs once, at the end, and only because a task above said "changed".', 'why'));
+      }
+    }
+    L.push(line(''));
+    L.push(line(stars('PLAY RECAP'), 'head'));
+    const per = (h) => `${h.padEnd(14)}: ok=${(ok + changed) / hosts.length | 0}  changed=${changed / hosts.length | 0}  unreachable=0  failed=0  skipped=${skipped ? 1 : 0}`;
+    for (const h of hosts) L.push(line(per(h), 'ok'));
+    return L;
+  }
+
+  function dryInventory(file, inv) {
+    const L = [line('$ ansible-inventory -i inventory.ini --graph', 'cmd')];
+    const walk = (g, pad, seen) => {
+      L.push(line(`${pad}|--@${g}:`, 'ok'));
+      for (const k of inv.kids[g] || []) if (!seen.has(k)) walk(k, pad + '  ', new Set([...seen, k]));
+      for (const h of inv.groups[g] || []) L.push(line(`${pad}  |--${h}`));
+    };
+    L.push(line('@all:'));
+    const childOf = new Set(Object.values(inv.kids).flat());
+    const tops = [...new Set([...Object.keys(inv.groups), ...Object.keys(inv.kids)])].filter((g) => !childOf.has(g));
+    for (const g of tops) walk(g, '  ', new Set([g]));
+    L.push(line('  |--@ungrouped:'));
+    L.push(line(''));
+    L.push(line('# Ansible reads every [group] and [group:children] and prints who belongs where. A host in two groups appears twice.', 'why'));
+    return L;
+  }
+
+  function dryAdhoc(info, inv) {
+    const hosts = (inv && inv.hostsOf(info.pattern)) || [];
+    const hs = hosts.length ? hosts : ['server1'];
+    const mod = info.mod.replace('ansible.builtin.', '');
+    const L = [line(`$ ansible ${info.pattern}${info.inv ? ' -i ' + info.inv : ''} -m ${info.mod}${info.args ? ' -a ' + info.args : ''}`, 'cmd'), line('')];
+    for (const h of hs) {
+      if (mod === 'ping') L.push(line(`${h} | SUCCESS => {`, 'ok'), line('    "changed": false,'), line('    "ping": "pong"'), line('}'));
+      else if (/^(command|shell)$/.test(mod)) L.push(line(`${h} | CHANGED | rc=0 >>`, 'changed'), line('    (the command output would appear here)'));
+      else L.push(line(`${h} | ${READ_ONLY.has(mod) ? 'SUCCESS' : 'CHANGED'} => {`, READ_ONLY.has(mod) ? 'ok' : 'changed'), line(`    "changed": ${READ_ONLY.has(mod) ? 'false' : 'true'}`), line('}'));
+    }
+    L.push(line(''));
+    L.push(line(`# "${info.pattern}" selects ${hosts.length ? hosts.join(', ') : 'the matching machines'}. The module "${mod}" runs on each, and "pong" means SSH works and Python is found.`, 'why'));
+    return L;
+  }
+
+  function dryTerraform(all, files) {
+    const L = [];
+    const rs = all.resources;
+    L.push(line('$ terraform init', 'cmd'));
+    L.push(line('Initializing the backend...', 'out'));
+    L.push(line('Initializing provider plugins...', 'out'));
+    for (const p of all.terraform && /required_providers/.test(all.terraform.body) ? [...all.terraform.body.matchAll(/source\s*=\s*"([^"]+)"[\s\S]*?version\s*=\s*"([^"]+)"/g)] : []) {
+      L.push(line(`- Installing ${p[1]} (version ${p[2].replace(/[~>=\s]/g, '')}.x)...`, 'out'));
+    }
+    L.push(line('Terraform has been successfully initialized!', 'ok'));
+    L.push(line('# init downloads the provider plugin that knows how to talk to AWS. It also creates the .terraform folder.', 'why'));
+    L.push(line(''));
+    L.push(line('$ terraform validate', 'cmd'));
+    L.push(line('Success! The configuration is valid.', 'ok'));
+    L.push(line(''));
+    L.push(line('$ terraform plan', 'cmd'));
+    if (!rs.length) {
+      L.push(line('No changes. Your infrastructure matches the configuration (there are no resources in these files).'));
+      L.push(line('# Provider and variable files describe settings only. Resources come from the other generators.', 'why'));
+      return L;
+    }
+    // Order: a resource comes after anything it refers to.
+    const key = (r) => r.labels.join('.');
+    const deps = new Map(rs.map((r) => [key(r), new Set([...r.body.matchAll(/\b([a-z][a-z0-9]*_[a-z0-9_]+)\.([A-Za-z_][\w-]*)/g)].map((m) => `${m[1]}.${m[2]}`).filter((k) => k !== key(r) && rs.some((x) => key(x) === k)))]));
+    const order = [];
+    const seen = new Set();
+    const visit = (k) => {
+      if (seen.has(k)) return;
+      seen.add(k);
+      for (const d of deps.get(k) || []) visit(d);
+      order.push(k);
+    };
+    for (const r of rs) visit(key(r));
+    L.push(line('Terraform will perform the following actions:', 'out'));
+    for (const k of order) {
+      const r = rs.find((x) => key(x) === k);
+      L.push(line(''));
+      L.push(line(`  # ${k} will be created`, 'out'));
+      L.push(line(`  + resource "${r.labels[0]}" "${r.labels[1]}" {`, 'changed'));
+      const entries = Object.entries(r.attrs).slice(0, 7);
+      const pad = Math.max(2, ...entries.map(([a]) => a.length), 2);
+      for (const [a, v] of entries) {
+        const computed = /\b(aws|data)[\w.]*\.\w+\.\w+|\$\{|\bvar\./.test(v) && /^(aws_|data\.)/.test(v.replace(/^\[|\]$/g, ''));
+        const shown = computed ? '(known after apply)' : /[{[]$/.test(v) ? v + ' ... ' + (v.endsWith('{') ? '}' : ']') : v.length > 52 ? v.slice(0, 50) + '...' : v;
+        L.push(line(`      + ${a.padEnd(pad)} = ${shown}`, 'changed'));
+      }
+      if (Object.keys(r.attrs).length > 7) L.push(line('      # ... more arguments', 'why'));
+      for (const nb of [...r.body.matchAll(/^\s{2}([a-z_]+)\s*\{/gm)].slice(0, 3)) L.push(line(`      + ${nb[1]} { ... }`, 'changed'));
+      L.push(line('      + id = (known after apply)', 'changed'));
+      L.push(line('    }', 'changed'));
+      const need = [...(deps.get(k) || [])];
+      if (need.length) L.push(line(`    # Created after ${need.join(', ')}, because it refers to ${need.length > 1 ? 'them' : 'it'}.`, 'why'));
+    }
+    L.push(line(''));
+    L.push(line(`Plan: ${rs.length} to add, 0 to change, 0 to destroy.`, 'head'));
+    if (all.outputs.length) {
+      L.push(line(''));
+      L.push(line('Changes to Outputs:', 'out'));
+      for (const o of all.outputs) L.push(line(`  + ${o.labels[0].padEnd(22)} = (known after apply)`, 'changed'));
+    }
+    L.push(line(''));
+    L.push(line('# plan only shows the future. Nothing is created until you run "terraform apply" and answer yes.', 'why'));
+    L.push(line(`# Costs money? ${rs.some((r) => /aws_instance|aws_nat|aws_db/.test(r.labels[0])) ? 'Yes: an instance is billed per hour while it runs. Run "terraform destroy" when you finish learning.' : 'Little or nothing for these resources, but check the AWS pricing page.'}`, 'why'));
+    return L;
+  }
+
+  function evalWhen(whenNode, scenario) {
+    const w = whenNode.body;
+    const results = [];
+    if (/changeRequest\(\)/.test(w)) results.push(scenario.pr);
+    if (/buildingTag\(\)/.test(w)) results.push(!!scenario.tag);
+    const t = w.match(/\btag\s+['"]([^'"]+)['"]/);
+    if (t) results.push(!!scenario.tag && new RegExp('^' + t[1].replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(scenario.tag));
+    const b = w.match(/\bbranch\s+['"]([^'"]+)['"]/);
+    if (b) results.push(!scenario.pr && !scenario.tag && scenario.branch === b[1]);
+    if (!results.length) return true;
+    return results.every(Boolean);
+  }
+
+  function drySteps(body, L, pad, env = {}) {
+    const sub = (t) => t.replace(/\$\{env\.(\w+)\}/g, (x, v) => (env[v] !== undefined ? env[v] : `<${v}>`));
+    for (const raw of body.split('\n')) {
+      const s = raw.trim();
+      if (!s || s.startsWith('//')) continue;
+      let m;
+      if ((m = s.match(/^sh\s+(['"])(.*)\1\s*$/))) L.push(line(`${pad}+ ${m[2].replace(/\\\$/g, '$')}`, 'out'));
+      else if ((m = s.match(/^sh\s+script\s*:\s*(['"])(.*)\1/))) L.push(line(`${pad}+ ${m[2]}`, 'out'));
+      else if ((m = s.match(/^echo\s+(['"])(.*)\1\s*$/))) L.push(line(`${pad}${sub(m[2])}`, 'out'));
+      else if (/^junit\b/.test(s)) L.push(line(`${pad}Recording test results`, 'ok'));
+      else if (/^archiveArtifacts\b/.test(s)) L.push(line(`${pad}Archiving artifacts`, 'ok'));
+      else if (/^cleanWs\b/.test(s)) L.push(line(`${pad}[WS-CLEANUP] Deleting project workspace...`, 'out'));
+      else if (/^input\b/.test(s)) {
+        const msg = (s.match(/message\s*:\s*['"]([^'"]*)['"]/) || [])[1] || 'Proceed?';
+        L.push(line(`${pad}Input requested: "${msg}"  (a person clicks the button in Jenkins; shown here as approved)`, 'skip'));
+      } else if (/^checkout\b|^git\b/.test(s)) L.push(line(`${pad}Cloning the repository...`, 'out'));
+      else if (/^withCredentials|^sshagent|^withEnv/.test(s)) L.push(line(`${pad}Masking supported pattern matches of the secret values in the log`, 'out'));
+      else if (/^(mail|slackSend)\b/.test(s)) L.push(line(`${pad}Sending a notification`, 'out'));
+    }
+  }
+
+  function dryJenkins(info) {
+    const { pipe, stages, text } = info;
+    const L = [];
+    const multi = /changeRequest\(\)|buildingTag\(\)|\bbranch\s+['"]|\btag\s+['"]/.test(text);
+    const mainBranch = (text.match(/\bbranch\s+['"]([^'"]+)['"]/) || [])[1] || 'main';
+    const scenarios = multi
+      ? [
+          { label: `A push to the "${mainBranch}" branch`, branch: mainBranch, pr: false, tag: null },
+          { label: 'A pull request', branch: 'PR-17', pr: true, tag: null },
+          ...(/\btag\s+['"]|buildingTag\(\)/.test(text) ? [{ label: 'A version tag (v1.0.0)', branch: 'v1.0.0', pr: false, tag: 'v1.0.0' }] : []),
+        ]
+      : [{ label: 'One run of the job', branch: mainBranch, pr: false, tag: null }];
+    const agentLine = () => {
+      const a = child(pipe, /^agent\b/)[0];
+      if (a && /docker/.test(a.body)) return `Running inside a Docker container: ${(a.body.match(/image\s+['"]([^'"]+)['"]/) || [])[1] || 'image'}`;
+      if (/^\s*agent\s+none/m.test(ownText(pipe)) && !a) return 'No agent at pipeline level (each stage picks its own)';
+      return 'Running on an available agent (the built-in node or any connected agent)';
+    };
+    for (const sc of scenarios) {
+      const env = { BUILD_NUMBER: '1', BRANCH_NAME: sc.branch, JOB_NAME: 'my-job', BUILD_URL: 'http://jenkins/job/my-job/1/', CHANGE_ID: sc.pr ? '17' : '', CHANGE_BRANCH: sc.pr ? 'feature-login' : '', CHANGE_TARGET: sc.pr ? mainBranch : '', TAG_NAME: sc.tag || '' };
+      L.push(line(`━━ ${sc.label} ━━`, 'head'));
+      if (multi) L.push(line(`# Variables Jenkins would set: BRANCH_NAME=${sc.branch}${sc.pr ? ', CHANGE_ID=17, CHANGE_TARGET=' + mainBranch : ''}${sc.tag ? ', TAG_NAME=' + sc.tag : ''}`, 'why'));
+      L.push(line('Started by user admin', 'out'));
+      L.push(line('[Pipeline] Start of Pipeline', 'out'));
+      L.push(line(`[Pipeline] ${agentLine()}`, 'out'));
+      const row = [];
+      for (const st of stages) {
+        const name = stageName(st);
+        const when = child(st, /^when$/)[0];
+        const run = !when || evalWhen(when, sc);
+        if (!run) {
+          L.push(line(`[Pipeline] { (${name})`, 'out'));
+          L.push(line(`Stage "${name}" skipped due to when conditional`, 'skip'));
+          L.push(line('[Pipeline] }', 'out'));
+          row.push([name, 'skip']);
+          continue;
+        }
+        L.push(line(`[Pipeline] { (${name})`, 'out'));
+        const mx = child(st, /^matrix$/)[0];
+        if (mx) {
+          const axes = [...mx.body.matchAll(/name\s+['"]([^'"]+)['"]\s*values\s+([^\n]+)/g)].map((m) => ({ name: m[1], values: [...m[2].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]) }));
+          let cells = [{}];
+          for (const ax of axes) cells = cells.flatMap((c) => ax.values.map((v) => Object.assign({}, c, { [ax.name]: v })));
+          L.push(line(`# The matrix makes ${cells.length} run(s) at the same time: one for each combination.`, 'why'));
+          const inner = child(child(mx, /^stages$/)[0] || { children: [] }, /^stage\s*\(/);
+          for (const c of cells) {
+            const tag = Object.entries(c).map(([k, v]) => `${k}=${v}`).join(', ');
+            L.push(line(`[${tag}] Running`, 'out'));
+            for (const is of inner) drySteps((child(is, /^steps$/)[0] || { body: '' }).body, L, `[${tag}]   `, env);
+          }
+        } else {
+          const par = child(st, /^parallel$/)[0];
+          if (par) for (const ps of child(par, /^stage\s*\(/)) drySteps((child(ps, /^steps$/)[0] || { body: '' }).body, L, `  (${stageName(ps)}) `, env);
+          drySteps((child(st, /^steps$/)[0] || { body: '' }).body, L, '  ', env);
+        }
+        const gate = child(st, /^steps$/)[0] && /\binput\b/.test(child(st, /^steps$/)[0].body);
+        L.push(line('[Pipeline] }', 'out'));
+        row.push([name, gate ? 'wait' : 'ok']);
+      }
+      const post = child(pipe, /^post$/)[0];
+      if (post && child(post, /^always$/).length) L.push(line('[Pipeline] post: always { ... }', 'out'));
+      L.push(line('[Pipeline] End of Pipeline', 'out'));
+      L.push(line('Finished: SUCCESS', 'ok'));
+      L.push(line(`  Stages: ${row.map(([n, s]) => `${s === 'skip' ? '⊘' : s === 'wait' ? '⏸' : '✓'} ${n}`).join('   ')}`, 'head'));
+      L.push(line('# ✓ ran   ⊘ skipped by a when condition   ⏸ waited for a person', 'why'));
+      L.push(line(''));
+    }
+    L.push(line('# This is a simulation. Real output also contains what your commands print (npm, pytest and so on), and a failing command would turn the run red.', 'why'));
+    return L;
+  }
+
+  function dryCompose(file, comp) {
+    const L = [line('$ docker compose up -d', 'cmd')];
+    const svcs = comp.value.services;
+    const hasBuild = Object.values(svcs).some((s) => s.build);
+    if (hasBuild) {
+      L.push(line('[+] Building (reads the Dockerfile)', 'out'));
+      L.push(line('# build: . means "make the image from the Dockerfile in this folder". That step also installs your plugins.', 'why'));
+    }
+    L.push(line('[+] Running', 'out'));
+    L.push(line(' ✔ Network default            Created', 'ok'));
+    for (const v of Object.keys(comp.value.volumes || {})) L.push(line(` ✔ Volume "${v}"  Created`, 'ok'));
+    for (const [n, s] of Object.entries(svcs)) {
+      L.push(line(` ✔ Container ${s.container_name || n}  Started`, 'ok'));
+      for (const p of s.ports || []) L.push(line(`# Port ${p}: open http://localhost:${String(p).split(':')[0]} on this machine.`, 'why'));
+    }
+    if (comp.used.length) L.push(line(`# Compose swaps in ${comp.used.map((v) => '${' + v + '}').join(', ')} from your .env file before starting.`, 'why'));
+    return L;
+  }
+
+  function dryShell(file) {
+    const L = [line(`$ bash ${base(file.path)}`, 'cmd')];
+    let note = '';
+    for (const raw of textOf(file).split('\n')) {
+      const s = raw.trim();
+      if (!s) continue;
+      if (s.startsWith('#!')) continue;
+      if (s.startsWith('#')) {
+        note = s.replace(/^#\s*/, '');
+        continue;
+      }
+      if (/^(set |[A-Z_]+=)/.test(s)) continue;
+      L.push(line(`+ ${s.length > 90 ? s.slice(0, 88) + '...' : s}`, 'out'));
+      if (note) {
+        L.push(line(`# ${note}`, 'why'));
+        note = '';
+      }
+    }
+    L.push(line('# These are the commands the script would run, in order. Read each "+" line as one step.', 'why'));
+    return L;
+  }
+
+  function dryCasc(value) {
+    const L = [line('Jenkins starts and reads jenkins.yaml (Configuration as Code):', 'cmd')];
+    const j = value.jenkins || {};
+    if (j.systemMessage) L.push(line(`+ set the banner: "${j.systemMessage}"`, 'changed'));
+    if (j.numExecutors !== undefined) L.push(line(`+ builds on the server itself: ${j.numExecutors} at a time${j.numExecutors === 0 ? ' (agents only)' : ''}`, 'changed'));
+    const users = j.securityRealm && j.securityRealm.local && j.securityRealm.local.users;
+    if (users) for (const u of users) L.push(line(`+ create user ${u.id} (password from the environment)`, 'changed'));
+    if (j.authorizationStrategy) L.push(line(`+ permissions: ${Object.keys(j.authorizationStrategy)[0]}`, 'changed'));
+    const loc = value.unclassified && value.unclassified.location;
+    if (loc && loc.url) L.push(line(`+ Jenkins URL: ${loc.url}`, 'changed'));
+    const cr = value.credentials && value.credentials.system && value.credentials.system.domainCredentials;
+    if (cr) for (const d of cr) for (const c of d.credentials || []) { const k = Object.keys(c)[0]; L.push(line(`+ credential "${c[k].id}" (${k})`, 'changed')); }
+    L.push(line('# Because the first-run wizard is skipped, this file is the whole setup. Edit the file and reload, instead of clicking in the web page.', 'why'));
+    return L;
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Entry point
+   * ---------------------------------------------------------------- */
+
+  function test(files) {
+    const checks = [];
+    const runs = [];
+    const skipped = [];
+    const inv = inventoryOf(files);
+    let tf = null;
+    let tfDone = false;
+
+    const roleTasks = (name) => {
+      const f = files.find((x) => new RegExp(`roles/${name}/tasks/main\\.ya?ml$`).test(x.path));
+      if (!f) return null;
+      const v = parseYaml(textOf(f)).value;
+      return isArr(v) ? v : null;
+    };
+
+    for (const f of files) {
+      const p = f.path;
+      const b = base(p);
+      try {
+        if (b === 'inventory.ini') {
+          checkInventory(f, checks);
+          if (inv) runs.push({ title: 'What Ansible sees in this inventory', note: 'Simulated: shows how Ansible would group your machines.', lines: dryInventory(f, inv) });
+        } else if (b === 'ansible.cfg') checkAnsibleCfg(f, checks);
+        else if (/\.tf$/.test(p)) {
+          if (!tfDone) {
+            tfDone = true;
+            tf = checkTerraform(files, checks);
+            if (tf) runs.push({ title: 'What Terraform would do', note: 'Simulated: Stanza reads your .tf files and shows init, validate and plan. It never contacts AWS.', lines: dryTerraform(tf, files) });
+          }
+        } else if (b === 'terraform.tfvars') checkTfvars(f, checks);
+        else if (b === '.gitignore') checkGitignore(f, files, checks);
+        else if (b === 'Jenkinsfile') {
+          const info = checkJenkinsfile(f, checks);
+          if (info && info.pipe) runs.push({ title: 'What Jenkins would do', note: 'Simulated: Stanza walks through your stages the way Jenkins would. Your own commands are not run.', lines: dryJenkins(info) });
+        } else if (/\.groovy$/.test(p)) checkGroovyLib(f, checks);
+        else if (b === 'plugins.txt') checkPlugins(f, checks);
+        else if (b === 'Dockerfile') checkDockerfile(f, files, checks);
+        else if (b === 'docker-compose.yml' || /docker-compose\..*\.ya?ml$/.test(b)) {
+          const c = checkCompose(f, files, checks);
+          if (c) runs.push({ title: 'What Docker Compose would do', note: 'Simulated: shows what "docker compose up -d" would create.', lines: dryCompose(f, c) });
+        } else if (b === 'jenkins.yaml') {
+          const v = checkCasc(f, files, checks);
+          if (v) runs.push({ title: 'What Jenkins would configure', note: 'Simulated: lists what the Configuration as Code file sets up when Jenkins starts.', lines: dryCasc(v) });
+        } else if (b === '.env.example') checkEnvExample(f, checks);
+        else if (/\.sh$/.test(p)) {
+          if (b === 'adhoc-command.sh') {
+            const info = checkAdhoc(f, checks);
+            if (info) runs.push({ title: 'What this ad-hoc command would do', note: 'Simulated: shows the kind of output Ansible prints for each machine.', lines: dryAdhoc(info, inv) });
+          } else {
+            checkShell(f, checks);
+            runs.push({ title: 'What this script would do', note: 'Simulated: lists the commands in order. Nothing is run.', lines: dryShell(f) });
+          }
+        } else if (/\.ya?ml$/.test(p)) {
+          const r = checkAnsibleYaml(f, files, checks);
+          if (r && r.kind === 'plays' && r.info) {
+            for (const play of r.info.plays) if (play.hosts) runs.push({ title: `What Ansible would do: ${play.name || play.hosts}`, note: 'Simulated "check mode": shows what each task would report. Nothing is changed.', lines: dryAnsiblePlay(play, files, inv, roleTasks) });
+          } else if (r && r.kind === 'tasks' && r.info && r.info.taskFile) {
+            skipped.push(p + ' (the role runs when a play uses it)');
+          }
+        } else if (/\.(md|j2|txt)$/.test(p)) skipped.push(p);
+      } catch (e) {
+        checks.push({ file: p, level: 'warn', name: 'Could not check', detail: 'The checker hit a problem reading this file: ' + e.message });
+      }
+    }
+    const counts = { pass: 0, warn: 0, error: 0, info: 0 };
+    for (const c of checks) counts[c.level]++;
+    return { checks, runs, counts, skipped };
+  }
+
+  return { test, parseYaml };
+})();
+
+if (typeof module !== 'undefined') module.exports = { Tester };
