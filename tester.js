@@ -1446,6 +1446,522 @@ const Tester = (() => {
   }
 
   /* ---------------------------------------------------------------- *
+   *  GitHub Actions: workflow files and dependabot.yml
+   * ---------------------------------------------------------------- */
+
+  const GHA_EVENTS = new Set([
+    'branch_protection_rule', 'check_run', 'check_suite', 'create', 'delete', 'deployment', 'deployment_status', 'discussion',
+    'discussion_comment', 'fork', 'gollum', 'issue_comment', 'issues', 'label', 'merge_group', 'milestone', 'page_build',
+    'public', 'pull_request', 'pull_request_review', 'pull_request_review_comment', 'pull_request_target', 'push',
+    'registry_package', 'release', 'repository_dispatch', 'schedule', 'status', 'watch', 'workflow_call', 'workflow_dispatch',
+    'workflow_run',
+  ]);
+
+  // Old majors of well-known actions. They run on Node versions GitHub has stopped supporting.
+  const GHA_OLD = {
+    'actions/checkout': 3, 'actions/setup-node': 3, 'actions/setup-python': 4, 'actions/setup-java': 3, 'actions/setup-go': 4,
+    'docker/login-action': 2, 'docker/build-push-action': 4, 'docker/setup-buildx-action': 2, 'docker/metadata-action': 4,
+    'github/codeql-action': 2,
+  };
+  // Majors GitHub switched off. A run that uses them fails.
+  const GHA_DEAD = { 'actions/upload-artifact': 3, 'actions/download-artifact': 3, 'actions/cache': 2 };
+  const GHA_DEAD_RUNNERS = /^(ubuntu-(16|18|20)\.04|macos-(10\.15|11|12)|windows-(2016|2019))$/;
+  const GHA_INJECT = /\$\{\{\s*(github\.(head_ref|event\.(issue\.(title|body)|pull_request\.(title|body|head\.(ref|label)|head\.repo\.default_branch)|comment\.body|review\.body|review_comment\.body|discussion\.(title|body)|pages\.[^}]*\.page_name|head_commit\.(message|author\.(email|name))|commits\S*|workflow_run\.(head_branch|head_commit\.message|head_commit\.author\.(email|name)|display_title)|release\.(name|body))))/;
+
+  const strOf = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : String(v));
+
+  // The line of a key inside a map (the parser keeps __lines for maps it built).
+  const keyLine = (obj, key) => (obj && obj.__lines && obj.__lines[key]) || lineOf(obj) || 0;
+
+  // "main", "release/*", "**" and so on, as a regular expression.
+  function globRe(p) {
+    const s = String(p).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\u0000/g, '.*');
+    return new RegExp('^' + s + '$');
+  }
+  const globAny = (pats, v) => (isArr(pats) ? pats : [pats]).some((p) => globRe(strOf(p)).test(v));
+
+  // The events a workflow listens to: { push: {...filters}, schedule: [...] }
+  function eventsOf(on) {
+    if (typeof on === 'string') return { [on]: {} };
+    if (isArr(on)) return Object.fromEntries(on.map((e) => [strOf(e), {}]));
+    if (isObj(on)) return Object.fromEntries(Object.entries(on).map(([k, v]) => [k, v === null ? {} : v]));
+    return {};
+  }
+
+  function checkCron(expr) {
+    const f = strOf(expr).trim().split(/\s+/);
+    if (f.length !== 5) return `A cron time needs 5 fields (minute hour day month weekday) but this has ${f.length}.`;
+    const ranges = [[0, 59, 'minute'], [0, 23, 'hour'], [1, 31, 'day of the month'], [1, 12, 'month'], [0, 6, 'day of the week']];
+    for (let i = 0; i < 5; i++) {
+      const [lo, hi, label] = ranges[i];
+      for (const part of f[i].split(',')) {
+        const m = part.match(/^(\*|\d+(?:-\d+)?)(?:\/(\d+))?$/);
+        if (!m) return `The ${label} field "${f[i]}" is not valid cron.`;
+        const nums = m[1] === '*' ? [] : m[1].split('-').map(Number);
+        if (nums.some((n) => n < lo || n > hi)) return `The ${label} field "${f[i]}" is outside ${lo} to ${hi}.`;
+        if (nums.length === 2 && nums[0] > nums[1]) return `The ${label} range "${part}" runs backwards.`;
+      }
+    }
+    return null;
+  }
+
+  function usesInfo(u) {
+    const s = strOf(u);
+    if (s.startsWith('./')) return { kind: 'local', name: s };
+    if (s.startsWith('docker://')) return { kind: 'docker', name: s };
+    const m = s.match(/^([^@\s]+)(?:@(\S+))?$/);
+    if (!m) return { kind: 'bad', name: s };
+    const name = m[1];
+    const ref = m[2] || '';
+    const major = (ref.match(/^v?(\d+)(?:[.\d]*)$/) || [])[1];
+    const parts = name.split('/');
+    return { kind: 'repo', name, ref, major: major === undefined ? null : Number(major), repoKey: parts.slice(0, 2).join('/'), valid: parts.length >= 2 };
+  }
+
+  function checkWorkflow(file, files, out) {
+    const text = textOf(file);
+    const { value, errors } = parseYaml(text);
+    const F = file.path;
+    const add = (level, name, detail, ln) => out.push({ file: F, level, name, detail, ...(ln ? { line: ln } : {}) });
+    for (const e of errors) add('error', 'YAML syntax', e.msg, e.line);
+    if (!errors.length) add('pass', 'YAML syntax', 'The file reads as valid YAML.');
+    if (errors.length || !isObj(value)) return null;
+
+    const on = value.on !== undefined ? value.on : value.true;
+    if (on === undefined || on === null) add('error', 'Has a trigger', 'A workflow needs an "on:" section that says what starts it.');
+    if (!isObj(value.jobs) || !Object.keys(value.jobs).length) {
+      add('error', 'Has jobs', 'A workflow needs a "jobs:" section with at least one job.');
+      return null;
+    }
+    const jobs = value.jobs;
+    const ev = eventsOf(on);
+    add('pass', 'Has jobs', `${Object.keys(jobs).length} job(s): ${Object.keys(jobs).join(', ')}.`);
+
+    // ---- events
+    const bad = Object.keys(ev).filter((k) => !GHA_EVENTS.has(k));
+    if (on !== undefined && on !== null) {
+      if (bad.length) add('error', 'Events are real', `"${bad.join('", "')}" is not an event GitHub knows. Events use underscores, such as pull_request.`, keyLine(value, 'on'));
+      else add('pass', 'Events are real', `Starts on: ${Object.keys(ev).join(', ')}.`);
+    }
+    if (isObj(ev.push) && (ev.push.branches !== undefined) && ev.push['branches-ignore'] !== undefined) add('error', 'Branch filters', 'push uses both "branches" and "branches-ignore". GitHub allows only one of them.', lineOf(ev.push));
+    if (ev.schedule !== undefined) {
+      const sch = isArr(ev.schedule) ? ev.schedule : [];
+      if (!sch.length) add('error', 'Schedule has a time', 'schedule needs a list with "- cron: ...".', keyLine(isObj(on) ? on : value, 'schedule'));
+      for (const s of sch) {
+        const c = isObj(s) ? s.cron : null;
+        const msg = c === undefined || c === null ? 'Each schedule entry needs "cron:".' : checkCron(c);
+        if (msg) add('error', 'Cron time is valid', msg, lineOf(s));
+        else {
+          add('pass', 'Cron time is valid', `"${c}" is valid. GitHub reads it as UTC.`);
+          if (/^\*\/[1-4]\s/.test(strOf(c)) || /^\*\s/.test(strOf(c))) add('info', 'Schedule is very frequent', 'GitHub runs scheduled workflows at most every 5 minutes, and may start them late.', lineOf(s));
+        }
+      }
+    }
+
+    // ---- permissions
+    const perm = (p, where, ln) => {
+      if (p === 'write-all') add('warn', 'Permissions are small', `${where} gives the token write access to everything ("write-all"). List only what is needed.`, ln);
+    };
+    const jobIds = Object.keys(jobs);
+    const topPerm = value.permissions;
+    perm(topPerm, 'The workflow', keyLine(value, 'permissions'));
+    const noPerm = jobIds.filter((id) => isObj(jobs[id]) && jobs[id].permissions === undefined);
+    if (topPerm === undefined && noPerm.length) add('warn', 'Permissions are set', 'No "permissions:" block. Depending on your repository settings the token may get broad write access. Add "permissions: contents: read" and raise it only where needed.');
+    else add('pass', 'Permissions are set', 'The token’s rights are written down.');
+
+    // ---- per job
+    let missingTimeout = [];
+    const ids = new Set(jobIds);
+    const graph = {};
+    for (const id of jobIds) {
+      const j = jobs[id];
+      const jl = keyLine(jobs, id);
+      if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(id)) add('error', 'Job names are valid', `The job ID "${id}" must start with a letter or underscore and use letters, digits, - and _ only.`, jl);
+      if (!isObj(j)) { add('error', 'Job is a map', `Job "${id}" has nothing inside it.`, jl); continue; }
+      permCheck: perm(j.permissions, `Job "${id}"`, keyLine(j, 'permissions'));
+      const reusable = j.uses !== undefined;
+      if (!reusable) {
+        if (j['runs-on'] === undefined) add('error', 'Job has runs-on', `Job "${id}" has no "runs-on:". GitHub does not know which machine to use.`, jl);
+        else {
+          const ro = j['runs-on'];
+          const names = isArr(ro) ? ro.map(strOf) : isObj(ro) ? [] : [strOf(ro)];
+          for (const r of names) if (GHA_DEAD_RUNNERS.test(r)) add('error', 'Runner still exists', `Job "${id}" asks for ${r}. GitHub has retired that machine image, so the job would wait forever. Use ubuntu-latest or a newer version.`, keyLine(j, 'runs-on'));
+        }
+        if (!isArr(j.steps) || !j.steps.length) add('error', 'Job has steps', `Job "${id}" has no "steps:".`, jl);
+        if (j['timeout-minutes'] === undefined) missingTimeout.push(id);
+      }
+      if (j['continue-on-error'] === true) add('info', 'continue-on-error', `Job "${id}" can fail without failing the run.`, keyLine(j, 'continue-on-error'));
+      const needs = j.needs === undefined ? [] : isArr(j.needs) ? j.needs.map(strOf) : [strOf(j.needs)];
+      graph[id] = needs;
+      for (const n of needs) {
+        if (n === id) add('error', 'needs is valid', `Job "${id}" waits for itself.`, keyLine(j, 'needs'));
+        else if (!ids.has(n)) add('error', 'needs is valid', `Job "${id}" needs "${n}", but there is no job with that name.`, keyLine(j, 'needs'));
+      }
+      // matrix
+      let mkeys = new Set();
+      const strat = isObj(j.strategy) ? j.strategy : null;
+      if (strat && isObj(strat.matrix)) {
+        for (const k of Object.keys(strat.matrix)) if (k !== 'include' && k !== 'exclude') mkeys.add(k);
+        for (const inc of isArr(strat.matrix.include) ? strat.matrix.include : []) if (isObj(inc)) for (const k of Object.keys(inc)) mkeys.add(k);
+      }
+      const stepIds = new Set((isArr(j.steps) ? j.steps : []).filter(isObj).map((s) => s.id).filter(Boolean));
+
+      // steps
+      (isArr(j.steps) ? j.steps : []).forEach((s, i) => {
+        if (!isObj(s)) return;
+        const sl = lineOf(s) || jl;
+        const label = s.name ? `"${s.name}"` : `step ${i + 1}`;
+        const hasRun = s.run !== undefined;
+        const hasUses = s.uses !== undefined;
+        if (!hasRun && !hasUses) add('error', 'Step does something', `In job "${id}", ${label} has neither "run:" nor "uses:".`, sl);
+        if (hasRun && hasUses) add('error', 'Step does something', `In job "${id}", ${label} has both "run:" and "uses:". A step does one or the other.`, sl);
+        if (hasUses) {
+          const u = usesInfo(s.uses);
+          const ul = keyLine(s, 'uses');
+          if (u.kind === 'bad' || (u.kind === 'repo' && !u.valid)) add('error', 'Action name is valid', `"${strOf(s.uses)}" is not written as owner/name@version.`, ul);
+          else if (u.kind === 'repo') {
+            if (!u.ref) add('error', 'Actions have a version', `"${u.name}" has no @version. Write something like ${u.name}@v1, so the step cannot change under you.`, ul);
+            else if (/^(main|master|latest|HEAD|develop|dev)$/.test(u.ref)) add('warn', 'Actions are pinned', `"${u.name}@${u.ref}" follows a moving branch. Whatever its owner pushes next will run in your workflow. Use a version tag or a full commit ID.`, ul);
+            else {
+              if (GHA_DEAD[u.repoKey] && u.major !== null && u.major <= GHA_DEAD[u.repoKey]) add('error', 'Action version is alive', `${u.name}@${u.ref} was switched off by GitHub, so the step fails. Use a newer major version.`, ul);
+              else if (GHA_OLD[u.repoKey] && u.major !== null && u.major <= GHA_OLD[u.repoKey]) add('warn', 'Action version is current', `${u.name}@${u.ref} is old and runs on a Node version GitHub no longer supports. Move to a newer major version.`, ul);
+            }
+            if (/^actions\/(upload|download)-artifact$/.test(u.repoKey) && /^v\d+/.test(u.ref)) {
+              /* nothing more to say */
+            }
+          }
+        }
+        if (hasRun) {
+          const code = strOf(s.run);
+          const rl = keyLine(s, 'run');
+          const m = code.match(GHA_INJECT);
+          if (m) add('error', 'No script injection', `Job "${id}": ${m[0].trim()} is pasted straight into a shell command. Text from other people (titles, comments, branch names) can then run as code. Put it in env: first and read it as a shell variable.`, rl);
+          else if (/\$\{\{\s*inputs\./.test(code)) add('warn', 'Inputs go through env', `Job "${id}": an input is pasted straight into a shell command. Pass it through env: and read it as a variable.`, rl);
+          if (/\$\{\{\s*secrets\./.test(code)) add(/\becho\b/.test(code) ? 'error' : 'warn', 'Secrets stay in env', `Job "${id}": a secret is written directly in a command${/\becho\b/.test(code) ? ' that prints it' : ''}. Put it in env: and read it as a shell variable. Anything printed to the log can leak.`, rl);
+          if (/::(set-output|save-state)\b|\bset-env\b|::add-path\b/.test(code)) add('error', 'Retired commands', `Job "${id}": ::set-output, ::save-state, set-env and add-path stopped working. Write to $GITHUB_OUTPUT, $GITHUB_STATE, $GITHUB_ENV or $GITHUB_PATH instead.`, rl);
+          if (/curl[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b/.test(code)) add('warn', 'No blind downloads', `Job "${id}": a script is downloaded and run in one go. If the site is hacked, so are you. Download it, check it, then run it.`, rl);
+        }
+        // literal secrets
+        for (const sect of ['env', 'with']) {
+          const m = s[sect];
+          if (!isObj(m)) continue;
+          for (const [k, v] of Object.entries(m)) {
+            if (SECRET_NAME.test(k) && typeof v === 'string' && v && !/\$\{\{/.test(v) && !PLACEHOLDER.test(v)) add('error', 'No secrets in the file', `Job "${id}": ${k} holds a real-looking value written in the file. Use \${{ secrets.NAME }}. Treat this one as leaked and replace it.`, keyLine(m, k));
+          }
+        }
+        // checkout of the pull request's own code under pull_request_target
+        if (ev.pull_request_target && hasUses && /^actions\/checkout/.test(strOf(s.uses)) && isObj(s.with) && /github\.event\.pull_request\.head|github\.head_ref/.test(strOf(s.with.ref))) {
+          add('error', 'Pull request code is not trusted', `Job "${id}": pull_request_target runs with your secrets, and this step checks out the pull request’s own code. A stranger’s code would run with your secrets.`, keyLine(s.with, 'ref'));
+        }
+        // expression checks on the whole step
+        const stepText = JSON.stringify(s);
+        for (const m2 of stepText.matchAll(/\bmatrix\.([A-Za-z_][\w-]*)/g)) {
+          if (!mkeys.has(m2[1])) add('error', 'Matrix value exists', `Job "${id}" reads matrix.${m2[1]}, but its matrix has no "${m2[1]}".`, sl);
+        }
+        for (const m2 of stepText.matchAll(/\bneeds\.([A-Za-z_][\w-]*)/g)) {
+          if (!needs.includes(m2[1])) add('error', 'needs lists what it reads', `Job "${id}" reads needs.${m2[1]}, but "${m2[1]}" is not in its needs: list.`, sl);
+        }
+        for (const m2 of stepText.matchAll(/\bsteps\.([A-Za-z_][\w-]*)\./g)) {
+          if (!stepIds.has(m2[1])) add('warn', 'Step ID exists', `Job "${id}" reads steps.${m2[1]}, but no step in this job has "id: ${m2[1]}".`, sl);
+        }
+      });
+    }
+    // cycles
+    const state = {};
+    let cyc = null;
+    const walk = (n, stack) => {
+      if (cyc || !graph[n]) return;
+      if (state[n] === 1) { cyc = [...stack.slice(stack.indexOf(n)), n]; return; }
+      if (state[n] === 2) return;
+      state[n] = 1;
+      for (const m of graph[n]) walk(m, [...stack, n]);
+      state[n] = 2;
+    };
+    for (const id of jobIds) walk(id, []);
+    if (cyc) add('error', 'Jobs do not wait in a circle', `These jobs wait for each other forever: ${cyc.join(' → ')}.`);
+    if (missingTimeout.length) add('info', 'Jobs have a time limit', `No timeout-minutes on: ${missingTimeout.join(', ')}. A stuck job can run for 6 hours and use your free minutes.`);
+
+    // ${{ must close
+    text.split('\n').forEach((l, i) => {
+      const t = l.replace(/#.*$/, '');
+      if ((t.match(/\$\{\{/g) || []).length !== (t.match(/\}\}/g) || []).length && !/\{\{[a-z]/.test(t)) add('error', 'Expressions are closed', 'A ${{ is not closed with }} on this line.', i + 1);
+    });
+    return { value, ev, jobs, text };
+  }
+
+  // ----- tiny evaluator for "if:" lines. Returns true, false or null (cannot tell).
+  function evalCond(expr, ctx) {
+    let e = strOf(expr).trim().replace(/^\$\{\{\s*/, '').replace(/\s*\}\}$/, '');
+    if (e === '') return true;
+    const tokens = [];
+    const re = /\s*(&&|\|\||==|!=|!|\(|\)|,|'(?:[^']|'')*'|[A-Za-z_][\w.\-]*|\d+)/y;
+    let m;
+    let pos = 0;
+    while (pos < e.length && (m = (re.lastIndex = pos, re.exec(e)))) { tokens.push(m[1]); pos = re.lastIndex; }
+    if (pos < e.length && e.slice(pos).trim()) return null;
+    let i = 0;
+    const lit = (t) => (t[0] === "'" ? t.slice(1, -1).replace(/''/g, "'") : t);
+    const val = (t) => {
+      if (t[0] === "'") return lit(t);
+      if (t === 'true') return true;
+      if (t === 'false') return false;
+      if (/^\d+$/.test(t)) return Number(t);
+      if (Object.prototype.hasOwnProperty.call(ctx.vars, t)) return ctx.vars[t];
+      return undefined;
+    };
+    const unknown = Symbol('unknown');
+    function primary() {
+      const t = tokens[i++];
+      if (t === undefined) throw unknown;
+      if (t === '!') { const v = primary(); if (v === unknown) return unknown; return !v; }
+      if (t === '(') { const v = or(); if (tokens[i++] !== ')') throw unknown; return v; }
+      if (tokens[i] === '(') {
+        i++;
+        const args = [];
+        while (tokens[i] !== ')') { if (tokens[i] === undefined) throw unknown; if (tokens[i] === ',') { i++; continue; } args.push(or()); }
+        i++;
+        const [a, b] = args;
+        if (a === unknown || (b === unknown && args.length > 1)) return unknown;
+        const fn = t.toLowerCase();
+        if (fn === 'always') return true;
+        if (fn === 'success') return ctx.success !== false;
+        if (fn === 'failure') return false;
+        if (fn === 'cancelled') return false;
+        if (fn === 'startswith') return strOf(a).toLowerCase().startsWith(strOf(b).toLowerCase());
+        if (fn === 'endswith') return strOf(a).toLowerCase().endsWith(strOf(b).toLowerCase());
+        if (fn === 'contains') return strOf(a).toLowerCase().includes(strOf(b).toLowerCase());
+        return unknown;
+      }
+      const v = val(t);
+      return v === undefined ? unknown : v;
+    }
+    function eq() {
+      let l = primary();
+      while (tokens[i] === '==' || tokens[i] === '!=') {
+        const op = tokens[i++];
+        const r = primary();
+        if (l === unknown || r === unknown) { l = unknown; continue; }
+        const same = strOf(l).toLowerCase() === strOf(r).toLowerCase();
+        l = op === '==' ? same : !same;
+      }
+      return l;
+    }
+    function and() {
+      let l = eq();
+      while (tokens[i] === '&&') { i++; const r = eq(); l = l === false || r === false ? false : l === unknown || r === unknown ? unknown : Boolean(l) && Boolean(r); }
+      return l;
+    }
+    function or() {
+      let l = and();
+      while (tokens[i] === '||') { i++; const r = and(); l = l === true || r === true ? true : l === unknown || r === unknown ? unknown : Boolean(l) || Boolean(r); }
+      return l;
+    }
+    try {
+      const v = or();
+      if (i < tokens.length) return null;
+      return v === unknown ? null : Boolean(v);
+    } catch (x) {
+      return null;
+    }
+  }
+
+  function expandMatrix(strat) {
+    if (!strat || !isObj(strat.matrix)) return null;
+    const m = strat.matrix;
+    const keys = Object.keys(m).filter((k) => k !== 'include' && k !== 'exclude');
+    let cells = [{}];
+    for (const k of keys) {
+      const vals = m[k];
+      if (!isArr(vals)) return { unknown: true, keys };
+      cells = cells.flatMap((c) => vals.map((v) => ({ ...c, [k]: v })));
+    }
+    for (const ex of isArr(m.exclude) ? m.exclude : []) {
+      if (!isObj(ex)) continue;
+      cells = cells.filter((c) => !Object.entries(ex).every(([k, v]) => strOf(c[k]) === strOf(v)));
+    }
+    for (const inc of isArr(m.include) ? m.include : []) {
+      if (!isObj(inc)) continue;
+      const hits = cells.filter((c) => keys.every((k) => inc[k] === undefined || strOf(c[k]) === strOf(inc[k])));
+      if (hits.length && keys.some((k) => inc[k] !== undefined)) hits.forEach((c) => Object.assign(c, inc));
+      else cells.push({ ...inc });
+    }
+    return { cells, keys };
+  }
+
+  const ACTION_NOTES = {
+    'actions/checkout': 'copies your repository onto the machine',
+    'actions/setup-node': 'installs Node.js',
+    'actions/setup-python': 'installs Python',
+    'actions/setup-java': 'installs Java',
+    'actions/setup-go': 'installs Go',
+    'actions/cache': 'restores or saves a cache',
+    'actions/upload-artifact': 'saves files from this run for download',
+    'actions/download-artifact': 'fetches files an earlier job saved',
+    'docker/setup-buildx-action': 'sets up the Docker builder',
+    'docker/setup-qemu-action': 'lets the machine build for ARM',
+    'docker/login-action': 'signs in to the registry',
+    'docker/metadata-action': 'works out image names and tags',
+    'docker/build-push-action': 'builds the image (and pushes it when allowed)',
+    'actions/configure-pages': 'reads the Pages settings',
+    'actions/upload-pages-artifact': 'packs the site for Pages',
+    'actions/deploy-pages': 'publishes the site to GitHub Pages',
+    'github/codeql-action': 'runs the CodeQL security scan',
+  };
+
+  function dryWorkflow(info) {
+    const { value, ev, jobs } = info;
+    const L = [];
+    const mainBranch = (isObj(ev.push) && isArr(ev.push.branches) && strOf(ev.push.branches.find((b) => !/[*!]/.test(strOf(b))))) || 'main';
+    const scenarios = [];
+    const filt = (e, kind, name) => {
+      if (!isObj(e)) return true;
+      const list = kind === 'tag' ? e.tags : e.branches;
+      const ign = kind === 'tag' ? e['tags-ignore'] : e['branches-ignore'];
+      if (kind === 'tag') { if (e.tags === undefined && e.branches !== undefined) return false; } else if (e.branches === undefined && e.tags !== undefined && !e['branches-ignore']) return false;
+      if (list !== undefined && !globAny(list, name)) return false;
+      if (ign !== undefined && globAny(ign, name)) return false;
+      return true;
+    };
+    if (ev.push) {
+      scenarios.push({ label: `A push to the "${mainBranch}" branch`, event: 'push', ref: `refs/heads/${mainBranch}`, name: mainBranch, type: 'branch', ok: filt(ev.push, 'branch', mainBranch) });
+      scenarios.push({ label: 'A push to a feature branch ("feature-x")', event: 'push', ref: 'refs/heads/feature-x', name: 'feature-x', type: 'branch', ok: filt(ev.push, 'branch', 'feature-x') });
+      if (isObj(ev.push) && (ev.push.tags !== undefined || ev.push['tags-ignore'] !== undefined)) scenarios.push({ label: 'A push of the tag "v1.0.0"', event: 'push', ref: 'refs/tags/v1.0.0', name: 'v1.0.0', type: 'tag', ok: filt(ev.push, 'tag', 'v1.0.0') });
+    }
+    if (ev.pull_request || ev.pull_request_target) {
+      const e = ev.pull_request || ev.pull_request_target;
+      scenarios.push({ label: `A pull request into "${mainBranch}"`, event: ev.pull_request ? 'pull_request' : 'pull_request_target', ref: 'refs/pull/7/merge', name: '7/merge', type: 'branch', ok: isObj(e) && e.branches !== undefined ? globAny(e.branches, mainBranch) : true });
+    }
+    if (ev.schedule) scenarios.push({ label: 'The schedule fires', event: 'schedule', ref: `refs/heads/${mainBranch}`, name: mainBranch, type: 'branch', ok: true });
+    if (ev.workflow_dispatch) scenarios.push({ label: 'Someone presses "Run workflow"', event: 'workflow_dispatch', ref: `refs/heads/${mainBranch}`, name: mainBranch, type: 'branch', ok: true });
+    for (const k of Object.keys(ev)) if (!['push', 'pull_request', 'pull_request_target', 'schedule', 'workflow_dispatch'].includes(k) && GHA_EVENTS.has(k) && scenarios.length < 6) scenarios.push({ label: `The "${k}" event`, event: k, ref: `refs/heads/${mainBranch}`, name: mainBranch, type: 'branch', ok: true, generic: true });
+
+    for (const sc of scenarios) {
+      L.push(line(`━━ ${sc.label} ━━`, 'head'));
+      if (!sc.ok) {
+        L.push(line('No run. This event does not match the branch or tag filters in "on:".', 'skip'));
+        L.push(line('# GitHub starts nothing, so nothing appears in the Actions tab.', 'why'));
+        continue;
+      }
+      if (sc.generic) L.push(line('# Stanza does not know this event’s details, so conditions that depend on them are shown as "cannot tell".', 'why'));
+      const vars = { 'github.event_name': sc.event, 'github.ref': sc.ref, 'github.ref_name': sc.name, 'github.ref_type': sc.type, 'github.actor': 'you', 'github.repository': 'you/your-repo', 'github.workflow': strOf(value.name) || 'workflow', 'github.base_ref': sc.event.startsWith('pull_request') ? mainBranch : '', 'github.head_ref': sc.event.startsWith('pull_request') ? 'feature-x' : '' };
+      const ctx = { vars, success: true };
+      L.push(line(`Event: ${sc.event}  ·  ref: ${sc.ref}`, 'out'));
+      const ids = Object.keys(jobs);
+      const status = {};
+      const done = new Set();
+      let wave = 0;
+      let guard = 0;
+      while (done.size < ids.length && guard++ < 20) {
+        const ready = ids.filter((id) => !done.has(id) && (isObj(jobs[id]) ? (jobs[id].needs === undefined ? [] : isArr(jobs[id].needs) ? jobs[id].needs.map(strOf) : [strOf(jobs[id].needs)]) : []).every((n) => done.has(n) || !jobs[n]));
+        if (!ready.length) break;
+        wave++;
+        if (ids.length > 1) L.push(line(`# Round ${wave}: ${ready.join(', ')} ${ready.length > 1 ? 'start at the same time' : 'starts'}.`, 'why'));
+        for (const id of ready) {
+          done.add(id);
+          const j = jobs[id];
+          if (!isObj(j)) { status[id] = 'skip'; continue; }
+          const needs = j.needs === undefined ? [] : isArr(j.needs) ? j.needs.map(strOf) : [strOf(j.needs)];
+          const alwaysCond = /always\(\)|failure\(\)|cancelled\(\)/.test(strOf(j.if));
+          const skippedNeed = needs.find((n) => status[n] === 'skip');
+          if (skippedNeed && !alwaysCond) {
+            L.push(line(`Job "${id}": skipped, because "${skippedNeed}" was skipped.`, 'skip'));
+            status[id] = 'skip';
+            continue;
+          }
+          if (j.if !== undefined) {
+            const r = evalCond(j.if, ctx);
+            if (r === false) { L.push(line(`Job "${id}": skipped, its "if:" is false here.`, 'skip')); status[id] = 'skip'; continue; }
+            if (r === null) L.push(line(`# Job "${id}" has an "if:" Stanza cannot work out, so it is shown as running.`, 'why'));
+          }
+          const mx = expandMatrix(isObj(j.strategy) ? j.strategy : null);
+          if (mx && mx.unknown) L.push(line(`# Job "${id}" builds its matrix from an expression, so it is shown once.`, 'why'));
+          const cells = mx && mx.cells ? mx.cells : [null];
+          if (mx && mx.cells) L.push(line(`# Job "${id}" is a matrix: ${cells.length} job(s) at the same time, one for each combination.`, 'why'));
+          for (const cell of cells) {
+            const sub = (s) => strOf(s).replace(/\$\{\{\s*matrix\.([\w-]+)\s*\}\}/g, (all, k) => (cell && cell[k] !== undefined ? strOf(cell[k]) : all)).replace(/\$\{\{\s*(github\.[\w.]+)\s*\}\}/g, (all, k) => (vars[k] !== undefined ? strOf(vars[k]) : all));
+            const suffix = cell && mx.keys.length ? ` (${mx.keys.map((k) => strOf(cell[k])).join(', ')})` : '';
+            const jname = sub(strOf(j.name) || id) + (j.name ? '' : suffix);
+            const runner = isArr(j['runs-on']) ? j['runs-on'].map(sub).join(', ') : j.uses ? 'a reusable workflow' : sub(strOf(j['runs-on']) || 'a machine');
+            L.push(line(`▶ ${jname}`, 'head'));
+            if (j.environment) L.push(line(`  # Uses environment "${strOf(isObj(j.environment) ? j.environment.name : j.environment)}". If it has required reviewers, the job waits here for approval.`, 'why'));
+            L.push(line(`  Runner: ${runner}`, 'out'));
+            if (j.uses) { L.push(line(`  Calls the reusable workflow ${strOf(j.uses)}`, 'ok')); continue; }
+            L.push(line('  ✓ Set up job', 'ok'));
+            for (const s of isArr(j.steps) ? j.steps : []) {
+              if (!isObj(s)) continue;
+              const cctx = { ...ctx };
+              if (s.if !== undefined) {
+                const r = evalCond(sub(s.if), cctx);
+                if (r === false) { L.push(line(`  – ${stepLabel(s, sub)}  (skipped: "if:" is false)`, 'skip')); continue; }
+                if (r === null) L.push(line(`  # The "if:" on the next step is not something Stanza can work out. Shown as running.`, 'why'));
+              }
+              if (s.uses !== undefined) {
+                const u = usesInfo(s.uses);
+                const note = u.kind === 'repo' ? ACTION_NOTES[u.repoKey] || ACTION_NOTES[u.name] || ACTION_NOTES[u.name.split('/').slice(0, 2).join('/')] : null;
+                L.push(line(`  ✓ ${stepLabel(s, sub)}${note ? `  → ${note}` : ''}`, 'ok'));
+              } else if (s.run !== undefined) {
+                L.push(line(`  ✓ ${s.name ? sub(s.name) : 'Run'}`, 'ok'));
+                for (const cmd of sub(s.run).split('\n').filter((c) => c.trim()).slice(0, 6)) L.push(line(`    $ ${cmd.trim()}`, 'cmd'));
+              }
+            }
+            L.push(line('  ✓ Complete job', 'ok'));
+            status[id] = 'ok';
+          }
+          if (!status[id]) status[id] = 'ok';
+        }
+      }
+      L.push(line('# Simulated: every command is assumed to succeed. Nothing is run.', 'why'));
+    }
+    if (!scenarios.length) L.push(line('No scenario to show: this workflow has no events Stanza can walk through.', 'out'));
+    return L;
+  }
+
+  function stepLabel(s, sub) {
+    if (s.name) return sub(s.name);
+    if (s.uses !== undefined) return `Run ${sub(s.uses)}`;
+    return `Run ${sub(strOf(s.run).split('\n')[0])}`;
+  }
+
+  const DEP_ECO = new Set(['bundler', 'cargo', 'composer', 'devcontainers', 'docker', 'docker-compose', 'dotnet-sdk', 'elm', 'github-actions', 'gitsubmodule', 'gomod', 'gradle', 'helm', 'maven', 'mix', 'npm', 'nuget', 'pip', 'pub', 'swift', 'terraform', 'uv', 'bun', 'opentofu', 'conda', 'rust-toolchain', 'vcpkg']);
+
+  function checkDependabot(file, out) {
+    const { value, errors } = parseYaml(textOf(file));
+    const F = file.path;
+    const add = (level, name, detail, ln) => out.push({ file: F, level, name, detail, ...(ln ? { line: ln } : {}) });
+    for (const e of errors) add('error', 'YAML syntax', e.msg, e.line);
+    if (!errors.length) add('pass', 'YAML syntax', 'The file reads as valid YAML.');
+    if (errors.length || !isObj(value)) return null;
+    if (value.version !== 2) add('error', 'Version is 2', 'The first line must be "version: 2".', keyLine(value, 'version'));
+    else add('pass', 'Version is 2', 'The file format version is right.');
+    if (!isArr(value.updates) || !value.updates.length) { add('error', 'Has updates', 'A dependabot.yml needs an "updates:" list with at least one entry.'); return null; }
+    for (const u of value.updates) {
+      if (!isObj(u)) continue;
+      const eco = strOf(u['package-ecosystem']);
+      const ul = lineOf(u);
+      if (!eco) add('error', 'Ecosystem is named', 'An entry has no "package-ecosystem:".', ul);
+      else if (!DEP_ECO.has(eco)) add('error', 'Ecosystem is real', `"${eco}" is not an ecosystem Dependabot knows. Examples: npm, pip, maven, gomod, docker, github-actions.`, keyLine(u, 'package-ecosystem'));
+      else add('pass', 'Ecosystem is real', `${eco} is a valid ecosystem.`);
+      if (u.directory === undefined && u.directories === undefined) add('error', 'Directory is set', `${eco || 'An entry'} needs "directory:" (use "/" for the top of the project).`, ul);
+      else if (typeof u.directory === 'string' && !u.directory.startsWith('/')) add('error', 'Directory starts with /', `directory "${u.directory}" must start with "/".`, keyLine(u, 'directory'));
+      if (!isObj(u.schedule) || !u.schedule.interval) add('error', 'Schedule is set', `${eco || 'An entry'} needs "schedule:" with an "interval:".`, ul);
+      else if (!['daily', 'weekly', 'monthly', 'quarterly', 'semiannually', 'yearly', 'cron'].includes(strOf(u.schedule.interval))) add('error', 'Interval is valid', `"${u.schedule.interval}" is not an interval. Use daily, weekly or monthly.`, keyLine(u.schedule, 'interval'));
+    }
+    return value;
+  }
+
+  function dryDependabot(value) {
+    const L = [line('Dependabot reads .github/dependabot.yml on the default branch:', 'cmd')];
+    for (const u of value.updates) {
+      if (!isObj(u)) continue;
+      const lim = u['open-pull-requests-limit'] === undefined ? 5 : u['open-pull-requests-limit'];
+      L.push(line(`${isObj(u.schedule) ? strOf(u.schedule.interval) : '?'}: checks ${strOf(u['package-ecosystem'])} in ${strOf(u.directory || (isArr(u.directories) ? u.directories.join(', ') : '?'))}`, 'changed'));
+      L.push(line(`    opens up to ${lim} pull request(s) when a newer version exists`, 'out'));
+    }
+    L.push(line('# Dependabot is run by GitHub. This is a description, not a real scan.', 'why'));
+    return L;
+  }
+
+  /* ---------------------------------------------------------------- *
    *  Entry point
    * ---------------------------------------------------------------- */
 
@@ -1480,7 +1996,13 @@ const Tester = (() => {
           }
         } else if (b === 'terraform.tfvars') checkTfvars(f, checks);
         else if (b === '.gitignore') checkGitignore(f, files, checks);
-        else if (b === 'Jenkinsfile') {
+        else if (/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/.test(p)) {
+          const w = checkWorkflow(f, files, checks);
+          if (w) runs.push({ title: 'What GitHub would do', note: 'Simulated: Stanza walks through your triggers and jobs the way GitHub would. Your own commands are not run.', lines: dryWorkflow(w) });
+        } else if (/(^|\/)\.github\/dependabot\.ya?ml$/.test(p)) {
+          const d = checkDependabot(f, checks);
+          if (d) runs.push({ title: 'What Dependabot would do', note: 'Simulated: describes what Dependabot would watch.', lines: dryDependabot(d) });
+        } else if (b === 'Jenkinsfile') {
           const info = checkJenkinsfile(f, checks);
           if (info && info.pipe) runs.push({ title: 'What Jenkins would do', note: 'Simulated: Stanza walks through your stages the way Jenkins would. Your own commands are not run.', lines: dryJenkins(info) });
         } else if (/\.groovy$/.test(p)) checkGroovyLib(f, checks);

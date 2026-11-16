@@ -4,7 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Stanza | Config files you can read line by line</title>
-  <meta name="description" content="Pick a DevOps tool, answer a few questions, and get a config file with a plain-English note beside every line.">
+  <meta name="description" content="Pick a DevOps tool, answer a few questions, and get a config file with a plain-English note beside every line. Ansible, Terraform, Jenkins and GitHub Actions, with a built-in checker and simulated dry run.">
+  <link rel="canonical" href="https://stanza-eta.vercel.app/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Stanza">
+  <meta property="og:title" content="Stanza: config files you can read line by line">
+  <meta property="og:description" content="Pick a DevOps tool, answer a few questions, and get a config with a plain-English note beside every line. Ansible, Terraform, Jenkins and GitHub Actions, plus a built-in checker and dry run.">
+  <meta property="og:url" content="https://stanza-eta.vercel.app/">
+  <meta property="og:image" content="https://stanza-eta.vercel.app/brand/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The Stanza logo beside a Jenkinsfile snippet with a plain-English note under it.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Stanza: config files you can read line by line">
+  <meta name="twitter:description" content="Ansible, Terraform, Jenkins and GitHub Actions configs with a plain-English note beside every line, plus a built-in checker.">
+  <meta name="twitter:image" content="https://stanza-eta.vercel.app/brand/og.png">
   <meta id="theme-color" name="theme-color" content="#ffffff">
 
   <!-- Set the theme before the page paints, so there is no flash of the wrong colours. -->
@@ -55,6 +69,8 @@
 
       <div id="reference" class="cmds" hidden></div>
 
+      <div id="checkpage" class="checkpage" hidden></div>
+
       <div class="bench">
         <form id="form" class="questions" aria-labelledby="form-title" novalidate>
           <noscript>Stanza needs JavaScript to build configs. Turn it on for this page and reload.</noscript>
@@ -70,6 +86,7 @@
             <div class="toolbar">
               <p id="crumb" class="crumb"></p>
               <div class="actions">
+                <button type="button" id="share" class="btn quiet"><span class="ico" data-icon="share"></span><span class="label">Share</span></button>
                 <button type="button" id="test" class="btn quiet" aria-pressed="false" aria-controls="testpanel"><span class="ico" data-icon="test"></span><span class="label">Test</span></button>
                 <button type="button" id="notes" class="btn quiet" aria-pressed="true"><span class="ico" data-icon="notes"></span><span class="label">Notes</span></button>
                 <button type="button" id="copy" class="btn primary"><span class="ico" data-icon="copy"></span><span class="label">Copy</span></button>
@@ -98,7 +115,7 @@
   </div>
 
   <footer class="foot">
-    <p>Ansible, Terraform and Docker are trademarks of their owners (Red Hat, HashiCorp and Docker, Inc.). Their logos appear here only to name each tool. Stanza is an independent project and is not affiliated with them. Logo shapes come from the Simple Icons project.</p>
+    <p>Ansible, Terraform, Jenkins, GitHub Actions and Docker are trademarks of their owners (Red Hat, HashiCorp, the Jenkins project, GitHub, Inc. and Docker, Inc.). Their logos appear here only to name each tool. Stanza is an independent project and is not affiliated with them. Logo shapes come from the Simple Icons project.</p>
   </footer>
 
   <dialog id="palette" class="palette" aria-label="Jump to a generator">
@@ -114,6 +131,7 @@
   <script src="terraform.js"></script>
   <script src="jenkins.js"></script>
   <script src="jenkins-more.js"></script>
+  <script src="gha.js"></script>
   <script src="tools.js"></script>
   <script src="commands.js"></script>
   <script src="modules.js"></script>
@@ -123,6 +141,7 @@
   <script src="tf-resources.js"></script>
   <script src="jk-ref.js"></script>
   <script src="jk-ref2.js"></script>
+  <script src="gha-ref.js"></script>
   <script src="tester.js"></script>
   <script src="zip.js"></script>
   <script src="app.js"></script>

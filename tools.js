@@ -1698,6 +1698,9 @@ const JENKINS_TOOLS_ALL = [
 ];
 const JENKINS_ORDER = ['pipeline', 'multibranch', 'matrix', 'deploy', 'library', 'setup', 'agent'];
 const JENKINS_TOOLS_LIST = JENKINS_ORDER.map((id) => JENKINS_TOOLS_ALL.find((x) => x.id === id));
+const GHA_TOOLS_ALL = typeof GITHUB_ACTIONS_TOOLS !== 'undefined' ? GITHUB_ACTIONS_TOOLS : require('./gha.js').GITHUB_ACTIONS_TOOLS;
+const GHA_ORDER = ['ci', 'matrix', 'docker', 'release', 'deploy', 'schedule', 'security'];
+const GHA_TOOLS_LIST = GHA_ORDER.map((id) => GHA_TOOLS_ALL.find((x) => x.id === id));
 const TERRAFORM_TOOLS_LIST = typeof TERRAFORM_TOOLS !== 'undefined' ? TERRAFORM_TOOLS : require('./terraform.js').TERRAFORM_TOOLS;
 
 const SUITES = [
@@ -1735,6 +1738,19 @@ const SUITES = [
       { id: 'plugins', label: 'Plugins' },
       { id: 'errors', label: 'Errors' },
       { id: 'admin', label: 'Admin and CLI' },
+    ],
+  },
+  {
+    id: 'actions',
+    label: 'GitHub Actions',
+    icon: 'brand/tools/githubactions.svg',
+    tools: GHA_TOOLS_LIST,
+    references: [
+      { id: 'concepts', label: 'Concepts' },
+      { id: 'triggers', label: 'Triggers' },
+      { id: 'expressions', label: 'Expressions' },
+      { id: 'actions', label: 'Actions' },
+      { id: 'errors', label: 'Errors' },
     ],
   },
   {

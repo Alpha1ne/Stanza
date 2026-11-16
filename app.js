@@ -27,6 +27,14 @@
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const ICONS = {
+    ci: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'm8.5 12.2 2.4 2.4 4.6-5'],
+    docker: ['M3.5 8.5 12 4l8.5 4.5v7L12 20l-8.5-4.5z', 'M12 12v8', 'M3.5 8.5 12 13l8.5-4.5'],
+    release: ['M3 12.2V4.5A1.5 1.5 0 0 1 4.5 3h7.7l8.3 8.3a1.5 1.5 0 0 1 0 2.1l-7.1 7.1a1.5 1.5 0 0 1-2.1 0z', 'M8 8h.01'],
+    schedule: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M12 7v5l3 2'],
+    security: ['M12 3 4.5 6v5.5c0 4.6 3.1 8.2 7.5 9.5 4.4-1.3 7.5-4.9 7.5-9.5V6z', 'm9 12 2.2 2.2L15.5 10'],
+    triggers: ['M13 3 5 13.5h6L10 21l8-10.5h-6z'],
+    expressions: ['M8 4C6 4 5.5 5 5.5 7v2c0 1.2-.6 2.3-2 3 1.4.7 2 1.8 2 3v2c0 2 .5 3 2.5 3', 'M16 4c2 0 2.5 1 2.5 3v2c0 1.2.6 2.3 2 3-1.4.7-2 1.8-2 3v2c0 2-.5 3-2.5 3'],
+    actions: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 16.5h7', 'M16.5 13v7'],
     inventory: [
       'M4.5 4h15A1.5 1.5 0 0 1 21 5.5v3a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 8.5v-3A1.5 1.5 0 0 1 4.5 4z',
       'M4.5 14h15a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5v-3A1.5 1.5 0 0 1 4.5 14z',
@@ -65,6 +73,7 @@
     archive: ['M4 8h16v12H4z', 'M3 4h18v4H3z', 'M10 12.5h4'],
     play: ['M7 4.5v15l12-7.5z'],
     test: ['M9 3h6', 'M10 3v6L5 19.2a1 1 0 0 0 .9 1.5h12.2a1 1 0 0 0 .9-1.5L14 9V3', 'M7.5 15h9'],
+    share: ['M12 15V3', 'M8 7l4-4 4 4', 'M5 12v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7'],
     notes: ['M5 4h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z'],
     search: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z', 'M20 20l-4-4'],
     commands: ['M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z', 'M8 9.5l2.6 2.5L8 14.5', 'M13 15h3.5'],
@@ -216,6 +225,10 @@
       }
       nav.append(group);
     }
+
+    const check = el('a', { class: 'suite check-link', href: '#/check' }, icon('test'), el('span', { text: 'Check my file' }));
+    if (view === 'check') check.setAttribute('aria-current', 'page');
+    nav.append(el('div', { class: 'group' }, check));
   }
 
   // On wide screens the file tabs live in the top bar, like a nav row. On phones they
@@ -269,6 +282,18 @@
   // the back button both land where you were.
   function route() {
     const m = location.hash.match(/^#\/([a-z]+)(?:\/([a-z0-9]+))?/) || [];
+    if (m[1] === 'check') {
+      suite = null;
+      tool = null;
+      refId = null;
+      view = 'check';
+      testOpen = false;
+      renderNav();
+      document.title = 'Check my file | Stanza';
+      showCheck();
+      return;
+    }
+    $('#checkpage').hidden = true;
     const before = suite;
     suite = SUITES.find((s) => s.id === m[1]) || SUITES[0];
     if (suite !== before) folded.delete(suite.id); // arriving in a tool always shows its list
@@ -296,8 +321,11 @@
     }
     showBench();
     renderForm();
+    const start = startingAnswers();
+    if (start.answers) applyAnswers(start.answers);
     compileNext = true;
     update();
+    if (start.shared) say('Opened with the answers from a shared link.');
   }
 
   /* ---------- Reference pages: Commands, Modules, Playbook concepts ---------- */
@@ -334,6 +362,66 @@
       piece: 'The example, line by line',
       col: 'Line',
       copy: 'Copy example',
+    },
+    'actions/concepts': {
+      groups: GHA_CONCEPT_GROUPS,
+      title: 'GitHub Actions concepts, explained',
+      lede: 'A workflow is one YAML file with a fixed shape. These are the parts you will meet in every one. Press the ? to see what each example does, line by line.',
+      find: 'Find an idea, such as needs, env or artifact',
+      noun: 'ideas',
+      piece: 'The example, line by line',
+      col: 'Line',
+      copy: 'Copy example',
+      words: GHA_CONCEPT_WORDS,
+      wordsTitle: 'New to GitHub Actions? Words you will see',
+    },
+    'actions/triggers': {
+      groups: GHA_TRIGGER_GROUPS,
+      title: 'Workflow triggers, explained',
+      lede: 'The on: section says what starts a workflow. Press the ? to see what each trigger does and what to watch out for.',
+      find: 'Find a trigger, such as push, schedule or tags',
+      noun: 'triggers',
+      piece: 'The example, line by line',
+      col: 'Line',
+      copy: 'Copy example',
+      words: GHA_TRIGGER_WORDS,
+      wordsTitle: 'New to triggers? Words you will see',
+    },
+    'actions/expressions': {
+      groups: GHA_EXPR_GROUPS,
+      title: 'Expressions and contexts, explained',
+      lede: 'The ${{ }} parts of a workflow read information about the run, and your secrets. Press the ? to see what each one gives you, and the safe way to use it.',
+      find: 'Find one, such as secrets, github or contains',
+      noun: 'entries',
+      piece: 'The example, piece by piece',
+      col: 'Part',
+      copy: 'Copy example',
+      words: GHA_EXPR_WORDS,
+      wordsTitle: 'New to expressions? Words you will see',
+    },
+    'actions/actions': {
+      groups: GHA_ACT_GROUPS,
+      title: 'Common actions, explained',
+      lede: 'Actions are ready-made steps. These are the ones almost every project uses. Press the ? to see what each one does and what its settings mean.',
+      find: 'Find an action, such as checkout, cache or login',
+      noun: 'actions',
+      piece: 'The step, setting by setting',
+      col: 'Setting',
+      copy: 'Copy example',
+      words: GHA_ACT_WORDS,
+      wordsTitle: 'New to actions? Words you will see',
+    },
+    'actions/errors': {
+      groups: GHA_ERR_GROUPS,
+      title: 'GitHub Actions errors, in plain English',
+      lede: 'Open the failed step on the run page, then match the last lines of its log here. Each entry says what it means and how to fix it.',
+      find: 'Find an error, such as exit code, denied or not found',
+      noun: 'errors',
+      piece: 'The message, piece by piece',
+      col: 'Part',
+      copy: 'Copy message',
+      words: GHA_ERR_WORDS,
+      wordsTitle: 'New to reading Actions errors? Words you will see',
     },
     'jenkins/concepts': {
       groups: JK_CONCEPT_GROUPS,
@@ -657,6 +745,19 @@
       el('h2', { id: 'form-title', text: tool.title }),
       el('p', { class: 'lede', text: tool.intro })
     );
+    const reset = el('button', { type: 'button', class: 'linkbtn', id: 'reset', text: 'Reset answers' });
+    reset.addEventListener('click', () => {
+      try {
+        localStorage.removeItem(storeKey());
+      } catch {
+        /* nothing stored */
+      }
+      renderForm();
+      compileNext = true;
+      update();
+      say('Answers reset to the defaults.');
+    });
+    form.append(reset);
 
     for (const group of tool.groups) {
       let box;
@@ -682,6 +783,87 @@
       values[f.id] = f.type === 'check' ? node.checked : node.value;
     }
     return values;
+  }
+
+
+  /* ---------- Share links and saved answers ---------- */
+
+  // Only the answers that differ from the defaults travel, so links stay short.
+  const toB64 = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const fromB64 = (s) => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
+
+  function answersDiff(values) {
+    const diff = {};
+    for (const f of allFields()) if (values[f.id] !== f.default) diff[f.id] = values[f.id];
+    return diff;
+  }
+
+  // Anything that arrives from a link or from storage is checked against the form before it is used.
+  function cleanAnswers(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const out = {};
+    for (const f of allFields()) {
+      if (!Object.prototype.hasOwnProperty.call(raw, f.id)) continue;
+      const v = raw[f.id];
+      if (f.type === 'check') {
+        if (typeof v === 'boolean') out[f.id] = v;
+      } else if (f.type === 'select') {
+        if (typeof v === 'string' && f.options.some((o) => o[0] === v)) out[f.id] = v;
+      } else if (typeof v === 'string' && v.length <= (f.type === 'area' ? 3000 : 300)) {
+        out[f.id] = v;
+      }
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  function applyAnswers(answers) {
+    for (const f of allFields()) {
+      if (!(f.id in answers)) continue;
+      const node = document.getElementById(`f-${f.id}`);
+      if (f.type === 'check') node.checked = answers[f.id];
+      else node.value = answers[f.id];
+    }
+  }
+
+  const storeKey = () => `stanza:answers:${suite.id}/${tool.id}`;
+
+  function loadSaved() {
+    try {
+      return cleanAnswers(JSON.parse(localStorage.getItem(storeKey())));
+    } catch {
+      return null;
+    }
+  }
+
+  function saveAnswers(values) {
+    try {
+      const diff = answersDiff(values);
+      if (Object.keys(diff).length) localStorage.setItem(storeKey(), JSON.stringify(diff));
+      else localStorage.removeItem(storeKey());
+    } catch {
+      /* private window or storage turned off: the form still works, it just forgets */
+    }
+  }
+
+  function shareUrl() {
+    const diff = answersDiff(readValues());
+    const base = `${location.href.split('#')[0]}#/${suite.id}/${tool.id}`;
+    return Object.keys(diff).length ? `${base}?a=${toB64(JSON.stringify(diff))}` : base;
+  }
+
+  function startingAnswers() {
+    const q = (location.hash.split('?')[1] || '').match(/(?:^|&)a=([A-Za-z0-9_-]+)/);
+    let shared = null;
+    if (q) {
+      try {
+        shared = cleanAnswers(JSON.parse(fromB64(q[1])));
+      } catch {
+        shared = null;
+      }
+      // Drop the long part from the address, so a refresh does not undo later changes.
+      history.replaceState(null, '', `${location.pathname}${location.search}#/${suite.id}/${tool.id}`);
+    }
+    return { answers: shared || loadSaved(), shared: !!shared };
   }
 
   function showErrors(errors) {
@@ -1098,44 +1280,25 @@
     return box;
   }
 
-  function renderTest(animate) {
-    const panel = $('#testpanel');
-    dryTimers.forEach(clearInterval);
-    dryTimers = [];
-    $('#test').setAttribute('aria-pressed', String(testOpen));
-    if (!testOpen) {
-      panel.hidden = true;
-      return;
-    }
-    panel.hidden = false;
-    if (!currentFiles) {
-      panel.replaceChildren(el('div', { class: 'test-head' }, el('h3', { id: 'test-title', text: 'Test' }), el('p', { text: 'Fix the highlighted answers first. The test needs a finished config to look at.' })));
-      return;
-    }
-    const res = Tester.test(currentFiles);
+  // The result cards shared by the Test button and the "Check my file" page.
+  function resultsNodes(res, files, jump, animate) {
     const { pass, warn, error, info } = res.counts;
-    const close = el('button', { type: 'button', class: 'btn quiet small', text: 'Close' });
-    close.addEventListener('click', () => {
-      testOpen = false;
-      renderTest(false);
-      $('#test').focus();
-    });
     const verdict = error
-      ? `${error} problem${error === 1 ? '' : 's'} to fix before you use these files.`
+      ? `${error} problem${error === 1 ? '' : 's'} to fix before you use ${files.length === 1 ? 'this file' : 'these files'}.`
       : warn
         ? `No errors. ${warn} warning${warn === 1 ? '' : 's'} worth a look.`
         : 'Every check passed.';
     const pill = (cls, n, word) => el('li', { class: `tpill t-${cls}` }, el('strong', { text: String(n) }), el('span', { text: ` ${word}` }));
 
-    // Checks, grouped by file. Files with problems start open.
-    const byFile = new Map(currentFiles.map((f) => [f.path, []]));
+    // Checks, grouped by file. Files with something to read start open.
+    const byFile = new Map(files.map((f) => [f.path, []]));
     for (const c of res.checks) (byFile.get(c.file) || byFile.set(c.file, []).get(c.file)).push(c);
     const groups = [];
     for (const [path, list] of byFile) {
       if (!list.length) continue;
       const bad = list.filter((c) => c.level === 'error' || c.level === 'warn').length;
-      const det = el('details', { class: 'tgroup' });
       const notes = list.filter((c) => c.level === 'info').length;
+      const det = el('details', { class: 'tgroup' });
       if (bad || notes) det.open = true;
       det.append(
         el(
@@ -1158,7 +1321,7 @@
         if (c.line) {
           const b = el('button', { type: 'button', class: 'tline', text: `line ${c.line}` });
           b.setAttribute('aria-label', `Show line ${c.line} of ${path}`);
-          b.addEventListener('click', () => jumpTo(path, c.line));
+          b.addEventListener('click', () => jump(path, c.line));
           li.append(b);
         }
         ul.append(li);
@@ -1167,6 +1330,37 @@
       groups.push(det);
     }
 
+    return [
+      el('p', { class: `tverdict ${error ? 't-error' : warn ? 't-warn' : 't-pass'}`, text: verdict, role: 'status' }),
+      el('ul', { class: 'tpills' }, pill('pass', pass, 'passed'), pill('warn', warn, warn === 1 ? 'warning' : 'warnings'), pill('error', error, error === 1 ? 'error' : 'errors'), pill('info', info, info === 1 ? 'note' : 'notes')),
+      el('h4', { class: 'tsub', text: 'Checks' }),
+      ...groups,
+      ...(res.skipped.length ? [el('p', { class: 'tskipped', text: `Not checked (documentation or runs later): ${res.skipped.join(', ')}.` })] : []),
+      ...(res.runs.length ? [el('h4', { class: 'tsub', text: 'Dry run (simulated)' })] : []),
+      ...res.runs.map((r) => dryBlock(r, animate)),
+    ];
+  }
+
+  function renderTest(animate) {
+    const panel = $('#testpanel');
+    dryTimers.forEach(clearInterval);
+    dryTimers = [];
+    $('#test').setAttribute('aria-pressed', String(testOpen));
+    if (!testOpen) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    if (!currentFiles) {
+      panel.replaceChildren(el('div', { class: 'test-head' }, el('h3', { id: 'test-title', text: 'Test' }), el('p', { text: 'Fix the highlighted answers first. The test needs a finished config to look at.' })));
+      return;
+    }
+    const close = el('button', { type: 'button', class: 'btn quiet small', text: 'Close' });
+    close.addEventListener('click', () => {
+      testOpen = false;
+      renderTest(false);
+      $('#test').focus();
+    });
     panel.replaceChildren(
       el(
         'div',
@@ -1174,15 +1368,209 @@
         el('div', {}, el('h3', { id: 'test-title', text: 'Test: checks and a simulated dry run' }), el('p', { text: 'Stanza has no server, so nothing is really run and nothing leaves your browser. It checks your files for mistakes, then shows what the real tool would do.' })),
         close
       ),
-      el('p', { class: `tverdict ${error ? 't-error' : warn ? 't-warn' : 't-pass'}`, text: verdict, role: 'status' }),
-      el('ul', { class: 'tpills' }, pill('pass', pass, 'passed'), pill('warn', warn, warn === 1 ? 'warning' : 'warnings'), pill('error', error, error === 1 ? 'error' : 'errors'), pill('info', info, info === 1 ? 'note' : 'notes')),
-      el('h4', { class: 'tsub', text: 'Checks' }),
-      ...groups,
-      ...(res.skipped.length ? [el('p', { class: 'tskipped', text: `Not checked (documentation or runs later): ${res.skipped.join(', ')}.` })] : []),
-      ...(res.runs.length ? [el('h4', { class: 'tsub', text: 'Dry run (simulated)' })] : []),
-      ...res.runs.map((r) => dryBlock(r, animate))
+      ...resultsNodes(Tester.test(currentFiles), currentFiles, jumpTo, animate)
     );
   }
+
+  /* ---------- Check my own file ---------- */
+
+  const CHECK_KINDS = [
+    ['auto', 'Detect automatically', ''],
+    ['jenkinsfile', 'Jenkinsfile (Jenkins pipeline)', 'Jenkinsfile'],
+    ['groovy', 'Jenkins shared library step (.groovy)', 'vars/step.groovy'],
+    ['jcasc', 'Jenkins Configuration as Code (jenkins.yaml)', 'jenkins.yaml'],
+    ['plugins', 'Jenkins plugins.txt', 'plugins.txt'],
+    ['workflow', 'GitHub Actions workflow (.yml)', '.github/workflows/ci.yml'],
+    ['dependabot', 'Dependabot (dependabot.yml)', '.github/dependabot.yml'],
+    ['playbook', 'Ansible playbook (.yml)', 'site.yml'],
+    ['tasks', 'Ansible role tasks (.yml)', 'roles/app/tasks/main.yml'],
+    ['inventory', 'Ansible inventory (.ini)', 'inventory.ini'],
+    ['cfg', 'ansible.cfg', 'ansible.cfg'],
+    ['terraform', 'Terraform (.tf)', 'main.tf'],
+    ['tfvars', 'terraform.tfvars', 'terraform.tfvars'],
+    ['compose', 'Docker Compose (docker-compose.yml)', 'docker-compose.yml'],
+    ['dockerfile', 'Dockerfile', 'Dockerfile'],
+    ['shell', 'Shell script (.sh)', 'script.sh'],
+    ['env', '.env file', '.env.example'],
+  ];
+
+  function detectKind(text, fileName) {
+    const n = (fileName || '').split(/[\\/]/).pop();
+    if (n) {
+      if (n === 'Jenkinsfile') return 'jenkinsfile';
+      if (/\.groovy$/.test(n)) return 'groovy';
+      if (n === 'jenkins.yaml' || n === 'jenkins.yml') return 'jcasc';
+      if (/^dependabot\.ya?ml$/.test(n)) return 'dependabot';
+      if (n === 'plugins.txt') return 'plugins';
+      if (n === 'inventory.ini' || /^hosts(\.ini)?$/.test(n)) return 'inventory';
+      if (n === 'ansible.cfg') return 'cfg';
+      if (/\.tfvars$/.test(n)) return 'tfvars';
+      if (/\.tf$/.test(n)) return 'terraform';
+      if (/^(docker-)?compose(\..+)?\.ya?ml$/.test(n)) return 'compose';
+      if (n === 'Dockerfile' || /^Dockerfile\./.test(n)) return 'dockerfile';
+      if (/\.sh$/.test(n)) return 'shell';
+      if (/^\.env/.test(n)) return 'env';
+    }
+    const t = text.replace(/\r/g, '');
+    if (/^\s*pipeline\s*\{/m.test(t) || /^\s*@Library/m.test(t)) return 'jenkinsfile';
+    if (/^\s*def\s+call\s*\(/m.test(t)) return 'groovy';
+    if (/^\s*(resource|provider|variable|output|data|module|terraform|locals)\b[^\n]*\{\s*$/m.test(t)) return 'terraform';
+    const first = t.split('\n').find((l) => l.trim() && !l.trim().startsWith('#')) || '';
+    if (/^FROM\s/i.test(first)) return 'dockerfile';
+    if (/^\s*services:\s*$/m.test(t)) return 'compose';
+    if (/^#!.*\b(ba)?sh\b/.test(t)) return 'shell';
+    if (/^\[defaults\]/m.test(t)) return 'cfg';
+    if (/^\s*jenkins:\s*$/m.test(t)) return 'jcasc';
+    if (/^\s*version:\s*2\s*$/m.test(t) && /^updates:\s*$/m.test(t)) return 'dependabot';
+    if (/^['"]?on['"]?:/m.test(t) && /^jobs:\s*$/m.test(t)) return 'workflow';
+    if (/^\[[^\]]+\]\s*$/m.test(t)) return 'inventory';
+    if (/^\s*-\s+(name|hosts|import_playbook):/m.test(t)) return /^\s*-?\s*hosts:/m.test(t) ? 'playbook' : 'tasks';
+    if (/^[A-Z][A-Z0-9_]*=/m.test(t)) return 'env';
+    const lines = t.split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean);
+    if (lines.length && lines.every((l) => /^[a-z0-9][a-z0-9-]*(:[\w.-]+)?$/.test(l))) return 'plugins';
+    return null;
+  }
+
+  const CHECK_EXAMPLE = `pipeline {
+    agent any
+    environment {
+        deploy_token = 'abc123secret456'
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh "npm ci"
+            }
+        }
+        stage('Deploy') {
+            steps {
+                input message: 'Deploy?'
+                sh "deploy --token \${deploy_token}"
+            }
+        }
+        stage('Notify') {
+        }
+    }
+}
+`;
+
+  function showCheck() {
+    setTabsShown(false);
+    $('.bench').hidden = true;
+    $('#planned').hidden = true;
+    $('#reference').hidden = true;
+    const box = $('#checkpage');
+    box.hidden = false;
+    window.scrollTo(0, 0);
+    if (box.childElementCount) return;
+
+    const kind = el('select', { id: 'check-kind' });
+    for (const [v, label] of CHECK_KINDS) kind.append(el('option', { value: v, text: label }));
+    const ta = el('textarea', { id: 'check-text', rows: 16, autocomplete: 'off', spellcheck: false, placeholder: 'Paste your Jenkinsfile, playbook, .tf file or other config here' });
+    ta.setAttribute('aria-describedby', 'check-hint');
+    const file = el('input', { type: 'file', id: 'check-file', accept: '.txt,.yml,.yaml,.ini,.cfg,.tf,.tfvars,.groovy,.sh,.env,.example,Jenkinsfile,Dockerfile,text/*' });
+    const run = el('button', { type: 'button', class: 'btn primary', id: 'check-run' }, icon('test'), el('span', { class: 'label', text: 'Check it' }));
+    const clear = el('button', { type: 'button', class: 'btn quiet', text: 'Clear' });
+    const sample = el('button', { type: 'button', class: 'btn quiet', text: 'Try a flawed example' });
+    const out = el('section', { id: 'check-results', class: 'testpanel', 'aria-live': 'polite', hidden: true });
+    const msg = el('p', { id: 'check-msg', class: 'hint', role: 'status' });
+
+    function jumpIn(path, n) {
+      const lines = ta.value.split('\n');
+      let start = 0;
+      for (let i = 0; i < n - 1 && i < lines.length; i++) start += lines[i].length + 1;
+      ta.focus();
+      ta.setSelectionRange(start, start + (lines[n - 1] || '').length);
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+      ta.scrollTop = Math.max(0, (n - 4) * lh);
+      ta.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    }
+
+    function doCheck() {
+      dryTimers.forEach(clearInterval);
+      dryTimers = [];
+      const text = ta.value.replace(/\r\n?/g, '\n');
+      msg.textContent = '';
+      if (!text.trim()) {
+        out.hidden = true;
+        msg.textContent = 'Paste a file first, or open one with the file button.';
+        return;
+      }
+      if (text.length > 300000) {
+        out.hidden = true;
+        msg.textContent = 'That file is over 300 KB, which is more than this checker is built for.';
+        return;
+      }
+      const picked = kind.value === 'auto' ? detectKind(text, file.files[0] && file.files[0].name) : kind.value;
+      if (!picked) {
+        out.hidden = true;
+        msg.textContent = 'Stanza could not tell what kind of file this is. Pick the kind from the list and check again.';
+        kind.focus();
+        return;
+      }
+      const spec = CHECK_KINDS.find((k) => k[0] === picked);
+      const fileName = file.files[0] ? file.files[0].name : '';
+      const path = kind.value === 'auto' && fileName && picked !== 'tasks' && picked !== 'groovy' && picked !== 'workflow' && picked !== 'dependabot' ? fileName : spec[2];
+      const files = [{ path, lines: text.replace(/\n$/, '').split('\n').map((t) => ({ t })) }];
+      let res;
+      try {
+        res = Tester.test(files);
+      } catch (err) {
+        out.hidden = true;
+        msg.textContent = 'The checker could not read this file: ' + err.message;
+        return;
+      }
+      const label = kind.value === 'auto' ? `Detected: ${spec[1]}. ` : '';
+      out.replaceChildren(
+        el('div', { class: 'test-head' }, el('div', {}, el('h3', { id: 'check-title', text: 'Results' }), el('p', { text: label + 'Checked in your browser. Nothing was uploaded.' }))),
+        ...resultsNodes(res, files, jumpIn, true)
+      );
+      out.hidden = false;
+      out.scrollIntoView({ block: 'start', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    }
+
+    run.addEventListener('click', doCheck);
+    clear.addEventListener('click', () => {
+      ta.value = '';
+      file.value = '';
+      kind.value = 'auto';
+      out.hidden = true;
+      msg.textContent = '';
+      ta.focus();
+    });
+    sample.addEventListener('click', () => {
+      ta.value = CHECK_EXAMPLE;
+      kind.value = 'auto';
+      file.value = '';
+      doCheck();
+    });
+    file.addEventListener('change', () => {
+      const f = file.files[0];
+      if (!f) return;
+      if (f.size > 300000) {
+        msg.textContent = 'That file is over 300 KB, which is more than this checker is built for.';
+        return;
+      }
+      const r = new FileReader();
+      r.onload = () => {
+        ta.value = String(r.result);
+        doCheck();
+      };
+      r.readAsText(f);
+    });
+
+    box.append(
+      el('h2', { text: 'Check my own file' }),
+      el('p', { class: 'lede', text: 'Already have a config? Paste it here and Stanza will read it the same way it reads its own: syntax, missing pieces, risky settings, and a simulated dry run of what the real tool would do. Your file never leaves this page, because Stanza has no server.' }),
+      el('div', { class: 'field' }, el('label', { for: 'check-kind', text: 'What kind of file is it?' }), kind),
+      el('div', { class: 'field' }, el('label', { for: 'check-text', text: 'Your file' }), ta, el('p', { class: 'hint', id: 'check-hint', text: 'It is checked on its own, so a reference to something defined in another file (a variable, a resource) shows as a note, not an error.' })),
+      el('div', { class: 'field' }, el('label', { for: 'check-file', text: 'Or open a file from your computer' }), file),
+      el('div', { class: 'check-actions' }, run, sample, clear),
+      msg,
+      out
+    );
+  }
+
 
   /* ---------- Update loop ---------- */
 
@@ -1209,6 +1597,7 @@
 
   function update() {
     const values = readValues();
+    saveAnswers(values);
     applyShowIf(values);
     const errors = tool.validate(values);
     showErrors(errors);
@@ -1292,6 +1681,17 @@
       testOpen = !testOpen;
       renderTest(true);
       if (testOpen) $('#testpanel').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    });
+
+    const shareBtn = $('#share');
+    const shareLabel = shareBtn.querySelector('.label');
+    let shareTimer;
+    shareBtn.addEventListener('click', async () => {
+      const ok = await copyText(shareUrl());
+      clearTimeout(shareTimer);
+      shareLabel.textContent = ok ? 'Link copied' : 'Copy failed';
+      say(ok ? 'A link with your answers is on the clipboard.' : 'Could not copy the link.');
+      shareTimer = setTimeout(() => (shareLabel.textContent = 'Share'), 1800);
     });
 
     const copyBtn = $('#copy');

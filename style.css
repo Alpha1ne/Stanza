@@ -1477,6 +1477,11 @@ select {
   border-top: 1px dashed var(--line-strong);
 }
 
+.cmd-panel p,
+.cmd-panel .tips li {
+  overflow-wrap: anywhere;
+}
+
 .cmd-panel[hidden] {
   display: none;
 }
@@ -2616,4 +2621,83 @@ details.optional[hidden] {
   .tcheck {
     flex-wrap: wrap;
   }
+}
+
+
+/* ---------- Share, reset and the "Check my file" page ---------- */
+
+.linkbtn {
+  margin: 0 0 0.6rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.82rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.linkbtn:hover {
+  color: var(--ink);
+}
+
+.checkpage {
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 0.5rem 0 2rem;
+}
+
+.checkpage[hidden] {
+  display: none;
+}
+
+.checkpage h2 {
+  margin: 0 0 0.4rem;
+  font-family: var(--display);
+  font-size: 1.6rem;
+  font-weight: 600;
+}
+
+.checkpage .lede {
+  max-width: 44rem;
+  margin: 0 0 1.2rem;
+  color: var(--muted);
+}
+
+.checkpage .field {
+  margin-bottom: 1rem;
+}
+
+.checkpage textarea {
+  min-height: 18rem;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+}
+
+.checkpage select,
+.checkpage input[type='file'] {
+  max-width: 100%;
+}
+
+.check-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+
+.suite.check-link {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.suite.check-link .ico,
+.suite.check-link svg {
+  flex: none;
 }
