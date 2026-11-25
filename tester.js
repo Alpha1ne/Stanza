@@ -1962,6 +1962,278 @@ const Tester = (() => {
   }
 
   /* ---------------------------------------------------------------- *
+   *  Argo CD (Application, ApplicationSet, AppProject)
+   * ---------------------------------------------------------------- */
+
+  const AC_SYNC_OPTS = new Set(['Validate', 'CreateNamespace', 'PrunePropagationPolicy', 'PruneLast', 'Replace', 'ServerSideApply', 'ApplyOutOfSyncOnly', 'RespectIgnoreDifferences', 'FailOnSharedResource', 'SkipDryRunOnMissingResource', 'Force', 'Prune', 'Delete', 'ClientSideApplyMigration']);
+  const AC_HOOKS = new Set(['PreSync', 'Sync', 'PostSync', 'SyncFail', 'Skip', 'PostDelete']);
+  const AC_GEN = new Set(['list', 'git', 'clusters', 'cluster', 'matrix', 'merge', 'scmProvider', 'pullRequest', 'clusterDecisionResource', 'plugin']);
+  const AC_DUR = /^\d+(ms|s|m|h)$/;
+  const AC_BUILTIN = new Set(['name', 'server', 'path', 'metadata', 'values', 'nameNormalized', 'project', 'branch', 'number', 'head_sha', 'labels', 'basename', 'basenameNormalized', 'segments', 'index']);
+
+  function acDocs(text) {
+    const lines = text.split('\n');
+    const docs = [];
+    let cur = { start: 0, lines: [] };
+    const real = (d) => d.lines.some((x) => x.trim() && !x.trim().startsWith('#'));
+    for (let i = 0; i < lines.length; i++) {
+      if (/^---\s*$/.test(lines[i])) {
+        if (real(cur)) docs.push(cur);
+        cur = { start: i + 1, lines: [] };
+      } else cur.lines.push(lines[i]);
+    }
+    if (real(cur)) docs.push(cur);
+    return docs;
+  }
+
+  function acRepoCheck(url, ln, add) {
+    if (/^https?:\/\/[^/@\s]+:[^/@\s]*@/.test(url) || /^https?:\/\/[^/@\s]*(token|ghp_|glpat-)[^/@\s]*@/i.test(url)) add('error', 'No password in the address', 'The repository address contains a login. Anyone who can read Git can read it. Add the repository with a Secret instead.', ln);
+    else if (/^http:\/\//.test(url)) add('warn', 'Repository uses https', `"${url}" is plain http. Use https:// so nothing travels unencrypted.`, ln);
+    else if (!/^(https:\/\/[^/\s]+\/\S+|ssh:\/\/git@\S+|git@[\w.-]+:\S+)$/.test(url)) add('error', 'Repository address looks right', `"${url}" is not an address Argo CD can use. Use https://host/owner/repo.git or git@host:owner/repo.git.`, ln);
+    else add('pass', 'Repository address looks right', 'The repository address has a valid shape.');
+  }
+
+  function acSpec(spec, where, add, tpl) {
+    // `tpl` true: values may hold {{ }} placeholders, so format rules are relaxed.
+    const holes = (s) => tpl && /\{\{/.test(String(s));
+    if (!isObj(spec)) { add('error', 'Has a spec', `${where} has no "spec:" section.`); return; }
+    if (spec.project === undefined) add('error', 'Project is set', 'spec.project is missing. Name a project, for example "default".', lineOf(spec));
+    else add('pass', 'Project is set', `Belongs to project "${spec.project}".`);
+    const srcs = isArr(spec.sources) ? spec.sources : null;
+    if (spec.source !== undefined && spec.sources !== undefined) add('error', 'One kind of source', 'Use "source" or "sources", not both.', keyLine(spec, 'sources'));
+    const list = srcs || (isObj(spec.source) ? [spec.source] : []);
+    if (!list.length) add('error', 'Has a source', 'No "source:" (or "sources:") was found. Argo CD needs to know where the config is.', lineOf(spec));
+    for (const s of list) {
+      if (!isObj(s)) continue;
+      const ln = keyLine(s, 'repoURL');
+      if (!s.repoURL) add('error', 'Repository is set', 'A source has no "repoURL:".', lineOf(s));
+      else if (!holes(s.repoURL)) acRepoCheck(strOf(s.repoURL), ln, add);
+      if (!s.path && !s.chart && !s.ref) add('error', 'Path or chart is set', 'A source needs "path:" (a folder in Git) or "chart:" (a Helm chart).', lineOf(s));
+      if (s.path && s.chart) add('error', 'Path or chart, not both', 'Use "path" for Git or "chart" for a Helm repository.', keyLine(s, 'chart'));
+      if (s.path !== undefined && !holes(s.path)) {
+        const p = strOf(s.path);
+        if (p.startsWith('/') || /(^|\/)\.\.(\/|$)/.test(p)) add('error', 'Path stays inside the repository', `path "${p}" must be relative to the repository and must not use "..".`, keyLine(s, 'path'));
+        else add('pass', 'Path stays inside the repository', `Reads the folder "${p}".`);
+      }
+      if (s.chart && s.targetRevision === undefined) add('warn', 'Chart version is pinned', 'No targetRevision for the chart. Give a version, or the newest one is used.', lineOf(s));
+      if (s.targetRevision === undefined && !s.chart && !s.ref) add('info', 'Revision is set', 'No targetRevision, so Argo CD uses HEAD (the default branch).', lineOf(s));
+      else if (/^(HEAD|main|master)$/.test(strOf(s.targetRevision)) && !s.chart) add('info', 'Revision follows a branch', `"${s.targetRevision}" moves with every push. A tag or commit stays put.`, keyLine(s, 'targetRevision'));
+    }
+    const d = spec.destination;
+    if (!isObj(d)) add('error', 'Destination is set', 'No "destination:". Say which cluster and namespace to deploy to.', lineOf(spec));
+    else {
+      if (d.server && d.name) add('error', 'Server or name, not both', 'A destination uses "server" or "name" to pick the cluster, not both.', keyLine(d, 'name'));
+      else if (!d.server && !d.name) add('error', 'Cluster is named', 'destination needs "server:" or "name:".', lineOf(d));
+      else add('pass', 'Cluster is named', 'The destination cluster is named.');
+      const ns = strOf(d.namespace);
+      if (!ns) add('warn', 'Namespace is set', 'No destination namespace. Resources without their own namespace land in "default".', lineOf(d));
+      else if (['kube-system', 'argocd', 'kube-public'].includes(ns)) add('warn', 'Not a system namespace', `Deploying into "${ns}" mixes your app with the cluster's own parts.`, keyLine(d, 'namespace'));
+    }
+    const sp = spec.syncPolicy;
+    if (isObj(sp)) {
+      if (isObj(sp.automated)) {
+        const a = sp.automated;
+        if (a.prune === true) add('info', 'Prune is on', 'Resources removed from Git are deleted from the cluster. Check this before moving files around.', keyLine(a, 'prune'));
+        if (a.allowEmpty === true) add('warn', 'allowEmpty is on', 'If the folder ever renders nothing, Argo CD will delete everything. Leave this off unless needed.', keyLine(a, 'allowEmpty'));
+        if (a.selfHeal === true) add('info', 'Self-heal is on', 'Changes made by hand in the cluster are undone.', keyLine(a, 'selfHeal'));
+      } else add('info', 'Sync is manual', 'No "automated:" block, so syncs happen only when you press Sync.', keyLine(sp, 'automated'));
+      if (isArr(sp.syncOptions)) for (const o of sp.syncOptions) {
+        const t = strOf(o);
+        const m = /^([A-Za-z]+)=(.+)$/.exec(t);
+        const ol = keyLine(sp, 'syncOptions');
+        if (!m) add('error', 'Sync option format', `"${t}" must look like Name=value, for example CreateNamespace=true.`, ol);
+        else if (!AC_SYNC_OPTS.has(m[1])) add('warn', 'Sync option is known', `"${m[1]}" is not a sync option Argo CD knows. Check the spelling (names are case-sensitive).`, ol);
+        else if (m[1] === 'Replace' && m[2] === 'true') add('warn', 'Replace=true is risky', 'Argo CD deletes and re-creates resources instead of patching them. That can cause downtime.', ol);
+        else if (!/^(true|false)$/.test(m[2]) && !['PrunePropagationPolicy'].includes(m[1])) add('warn', 'Sync option value', `"${t}": the value is normally true or false.`, ol);
+      }
+      if (isObj(sp.retry)) {
+        const r = sp.retry;
+        if (r.limit !== undefined && typeof r.limit !== 'number') add('error', 'Retry limit is a number', `retry.limit "${r.limit}" must be a number.`, keyLine(r, 'limit'));
+        if (isObj(r.backoff)) for (const k of ['duration', 'maxDuration']) if (r.backoff[k] !== undefined && !AC_DUR.test(strOf(r.backoff[k]))) add('error', 'Backoff time format', `backoff.${k} "${r.backoff[k]}" must look like 5s, 3m or 1h.`, keyLine(r.backoff, k));
+        if (isObj(r.backoff) && r.backoff.factor !== undefined && typeof r.backoff.factor !== 'number') add('error', 'Backoff factor is a number', 'backoff.factor must be a number, such as 2.', keyLine(r.backoff, 'factor'));
+      }
+    } else add('info', 'Sync is manual', 'No syncPolicy, so syncs happen only when you press Sync.', lineOf(spec));
+    if (isArr(spec.ignoreDifferences)) for (const e of spec.ignoreDifferences) {
+      if (!isObj(e)) continue;
+      if (!e.kind && !e.jsonPointers && !e.jqPathExpressions && !e.managedFieldsManagers) add('error', 'ignoreDifferences is complete', 'An entry says nothing to ignore. Add jsonPointers, jqPathExpressions or managedFieldsManagers.', lineOf(e));
+      if (e.kind === undefined && !e.managedFieldsManagers) add('warn', 'ignoreDifferences names a kind', 'Without "kind:" the rule applies to every resource.', lineOf(e));
+      if (isArr(e.jsonPointers)) for (const p of e.jsonPointers) if (!String(p).startsWith('/')) add('error', 'JSON pointer starts with /', `"${p}" must start with "/", for example /spec/replicas.`, keyLine(e, 'jsonPointers'));
+    }
+  }
+
+  function acMeta(v, out, add) {
+    const m = isObj(v.metadata) ? v.metadata : {};
+    const nm = strOf(m.name);
+    if (!nm && !(isObj(m) && m.generateName)) add('error', 'Has a name', 'metadata.name is missing.', keyLine(v, 'metadata'));
+    else if (nm && !/\{\{/.test(nm)) {
+      if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(nm) || nm.length > 253) add('error', 'Name is valid', `"${nm}" must use lowercase letters, digits, "-" and "." only, and start and end with a letter or digit.`, keyLine(m, 'name'));
+      else add('pass', 'Name is valid', `The name "${nm}" is fine.`);
+    }
+    if (m.namespace !== undefined && m.namespace !== 'argocd') add('warn', 'Lives in the Argo CD namespace', `Argo CD only reads these objects from its own namespace (normally "argocd"), not "${m.namespace}".`, keyLine(m, 'namespace'));
+    const ann = isObj(m.annotations) ? m.annotations : {};
+    const w = ann['argocd.argoproj.io/sync-wave'];
+    if (w !== undefined && !/^-?\d+$/.test(strOf(w))) add('error', 'Sync wave is a whole number', `sync-wave "${w}" must be a whole number written as text, like "1".`, keyLine(m, 'annotations'));
+    const h = ann['argocd.argoproj.io/hook'];
+    if (h !== undefined) for (const x of strOf(h).split(',').map((s) => s.trim())) if (!AC_HOOKS.has(x)) add('error', 'Hook phase is valid', `hook "${x}" is not a phase. Use PreSync, Sync, PostSync or SyncFail.`, keyLine(m, 'annotations'));
+    if (isArr(m.finalizers)) for (const f of m.finalizers) {
+      const t = strOf(f);
+      if (/^resources-finalizer\.argocd\.argoproj\.io(\/(background|foreground))?$/.test(t)) add('pass', 'Finalizer is spelled right', 'Deleting this app also deletes what it deployed.', keyLine(m, 'finalizers'));
+      else if (/argocd/i.test(t) && /finalizer/i.test(t)) add('error', 'Finalizer is spelled right', `"${t}" is not the real name, so it is ignored. Use resources-finalizer.argocd.argoproj.io.`, keyLine(m, 'finalizers'));
+    } else if (v.kind === 'Application') add('info', 'No finalizer', 'Deleting this Application leaves what it deployed running with nothing managing it. Add resources-finalizer.argocd.argoproj.io to delete both.', keyLine(v, 'metadata'));
+  }
+
+  function acProject(v, add) {
+    const s = isObj(v.spec) ? v.spec : {};
+    const pname = strOf(isObj(v.metadata) ? v.metadata.name : '');
+    if (!isArr(s.sourceRepos) || !s.sourceRepos.length) add('warn', 'Repositories are limited', 'No sourceRepos: no application can use this project.', lineOf(s));
+    else if (s.sourceRepos.includes('*')) add('warn', 'Repositories are limited', 'sourceRepos "*" lets any repository deploy through this project.', keyLine(s, 'sourceRepos'));
+    else add('pass', 'Repositories are limited', `${s.sourceRepos.length} repository pattern(s) allowed.`);
+    if (!isArr(s.destinations) || !s.destinations.length) add('warn', 'Destinations are limited', 'No destinations: no application can deploy through this project.', lineOf(s));
+    else for (const d of s.destinations) {
+      if (!isObj(d)) continue;
+      if (d.namespace === '*' || d.server === '*' || d.name === '*') add('warn', 'Destinations are limited', 'A destination uses "*", so apps can deploy to every namespace or cluster.', lineOf(d));
+      if (d.server && d.name) add('error', 'Server or name, not both', 'A destination uses "server" or "name", not both.', lineOf(d));
+    }
+    for (const k of ['clusterResourceWhitelist', 'namespaceResourceBlacklist', 'clusterResourceBlacklist', 'namespaceResourceWhitelist']) {
+      if (isArr(s[k])) for (const e of s[k]) if (isObj(e) && e.group === '*' && e.kind === '*' && /Whitelist/.test(k)) add('warn', 'Resource kinds are limited', `${k} allows every kind, including cluster-wide ones such as ClusterRole.`, lineOf(e));
+    }
+    if (isArr(s.roles)) for (const r of s.roles) {
+      if (!isObj(r)) continue;
+      const rn = strOf(r.name);
+      for (const p of isArr(r.policies) ? r.policies : []) {
+        const parts = strOf(p).split(',').map((x) => x.trim());
+        const pl = keyLine(r, 'policies');
+        if (parts.length !== 6 || parts[0] !== 'p') { add('error', 'Policy has six parts', `"${p}" must be: p, proj:PROJECT:ROLE, resource, action, PROJECT/object, allow|deny.`, pl); continue; }
+        if (parts[1] !== `proj:${pname}:${rn}`) add('error', 'Policy names its role', `"${parts[1]}" should be proj:${pname}:${rn}.`, pl);
+        if (!/^(allow|deny)$/.test(parts[5])) add('error', 'Policy effect', `"${parts[5]}" must be allow or deny.`, pl);
+        if (!parts[4].startsWith(`${pname}/`) && parts[4] !== '*') add('error', 'Policy stays in the project', `"${parts[4]}" should start with "${pname}/".`, pl);
+        if (parts[3] === '*' && parts[5] === 'allow') add('warn', 'Policy is narrow', 'Action "*" allows everything, including delete and override.', pl);
+      }
+    }
+    add('pass', 'Project is a fence', 'The project has the parts Argo CD expects.');
+  }
+
+  function acSet(v, add) {
+    const s = isObj(v.spec) ? v.spec : {};
+    const gens = isArr(s.generators) ? s.generators : [];
+    if (!gens.length) add('error', 'Has a generator', 'An ApplicationSet needs "generators:" with at least one entry.', lineOf(s));
+    for (const g of gens) {
+      if (!isObj(g)) continue;
+      const keys = Object.keys(g).filter((k) => AC_GEN.has(k));
+      if (keys.length !== 1) add('error', 'One generator type per entry', `Each generator entry uses exactly one type (${[...AC_GEN].slice(0, 4).join(', ')}...). Found ${keys.length}.`, lineOf(g));
+    }
+    const t = isObj(s.template) ? s.template : null;
+    if (!t) { add('error', 'Has a template', 'No "template:". It describes the Applications to make.', lineOf(s)); return null; }
+    const tname = strOf(isObj(t.metadata) ? t.metadata.name : '');
+    if (!tname) add('error', 'Template has a name', 'template.metadata.name is missing.', lineOf(t));
+    else if (!/\{\{/.test(tname)) add('error', 'Template name varies', `"${tname}" has no placeholder, so every generated Application would get the same name.`, lineOf(t));
+    else add('pass', 'Template name varies', 'The name uses a placeholder, so each Application is unique.');
+    const raw = JSON.stringify(t);
+    const go = s.goTemplate === true;
+    if (go && /\{\{\s*[A-Za-z_][\w-]*\s*\}\}/.test(raw)) add('warn', 'Placeholder style', 'goTemplate is on, but a placeholder has no dot. Write {{ .name }}, not {{name}}.', keyLine(s, 'goTemplate'));
+    if (!go && /\{\{\s*\./.test(raw)) add('warn', 'Placeholder style', 'A placeholder starts with a dot, but goTemplate is off. Add "goTemplate: true", or write {{name}}.', keyLine(s, 'goTemplate'));
+    if (go && !(isArr(s.goTemplateOptions) && s.goTemplateOptions.includes('missingkey=error'))) add('info', 'Missing keys are caught', 'Add goTemplateOptions: ["missingkey=error"] so a typo in a placeholder fails loudly instead of making an empty name.', keyLine(s, 'goTemplate'));
+    if (isObj(s.syncPolicy) && s.syncPolicy.preserveResourcesOnDeletion === true) add('info', 'Apps survive deletion', 'preserveResourcesOnDeletion keeps deployed resources when the ApplicationSet is deleted.', keyLine(s, 'syncPolicy'));
+    acSpec(t.spec, 'The template', add, true);
+    // list generator: names must be unique, and placeholders must exist
+    const lg = gens.length === 1 && isObj(gens[0]) && isObj(gens[0].list) && isArr(gens[0].list.elements) ? gens[0].list.elements.filter(isObj) : null;
+    if (lg) {
+      const have = new Set();
+      for (const e of lg) for (const k of Object.keys(e)) have.add(k);
+      for (const m of raw.matchAll(/\{\{\s*\.([A-Za-z_]\w*)/g)) if (!have.has(m[1]) && !AC_BUILTIN.has(m[1])) { add('error', 'Placeholder has a value', `The template uses {{ .${m[1]} }}, but no list element has a "${m[1]}" key.`, lineOf(t)); break; }
+      const nk = /^\{\{\s*\.(\w+)\s*\}\}$/.exec(tname) || /\{\{\s*\.(\w+)\s*\}\}/.exec(tname);
+      if (nk) {
+        const vals = lg.map((e) => strOf(e[nk[1]]));
+        const dup = vals.find((x, i) => x && vals.indexOf(x) !== i);
+        if (dup) add('error', 'Names are unique', `Two list elements give "${nk[1]}" the value "${dup}", so two Applications would share a name.`, lineOf(gens[0]));
+      }
+    }
+    return { gens, t, lg, tname, go };
+  }
+
+  function checkArgo(file, out) {
+    const text = textOf(file);
+    const F = file.path;
+    const results = [];
+    for (const doc of acDocs(text)) {
+      const off = doc.start;
+      const add = (level, name, detail, ln) => out.push({ file: F, level, name, detail, ...(ln ? { line: ln + off } : {}) });
+      const { value: v, errors } = parseYaml(doc.lines.join('\n'));
+      for (const e of errors) add('error', 'YAML syntax', e.msg, e.line);
+      if (errors.length || !isObj(v)) { if (!errors.length) add('error', 'YAML syntax', 'This part of the file is not a YAML mapping.'); continue; }
+      if (!errors.length) add('pass', 'YAML syntax', 'The file reads as valid YAML.');
+      const av = strOf(v.apiVersion);
+      if (!av.startsWith('argoproj.io/')) { add('error', 'apiVersion is Argo CD', `apiVersion "${av}" should be argoproj.io/v1alpha1.`, keyLine(v, 'apiVersion')); continue; }
+      if (av !== 'argoproj.io/v1alpha1') add('warn', 'apiVersion is known', `"${av}" is not the usual argoproj.io/v1alpha1.`, keyLine(v, 'apiVersion'));
+      else add('pass', 'apiVersion is right', 'argoproj.io/v1alpha1 is the version Argo CD uses.');
+      const kind = strOf(v.kind);
+      if (!['Application', 'ApplicationSet', 'AppProject'].includes(kind)) { add('error', 'Kind is known', `"${kind}" is not an Application, ApplicationSet or AppProject.`, keyLine(v, 'kind')); continue; }
+      add('pass', 'Kind is known', `This is an ${kind}.`);
+      acMeta(v, out, add);
+      let info = null;
+      if (kind === 'Application') acSpec(v.spec, 'This Application', add, false);
+      else if (kind === 'ApplicationSet') info = acSet(v, add);
+      else acProject(v, add);
+      results.push({ kind, v, info });
+    }
+    return results;
+  }
+
+  const acSub = (s, el) => String(s).replace(/\{\{\s*\.(\w+)\s*\}\}/g, (m, k) => (el && el[k] !== undefined ? strOf(el[k]) : m));
+
+  function dryArgo(r) {
+    const { kind, v } = r;
+    const L = [];
+    const name = strOf(v.metadata && v.metadata.name);
+    if (kind === 'AppProject') {
+      const s = isObj(v.spec) ? v.spec : {};
+      L.push(line(`Project "${name}" is a fence. Applications in it may only:`, 'cmd'));
+      for (const x of isArr(s.sourceRepos) ? s.sourceRepos : []) L.push(line(`  read from   ${x}`, 'out'));
+      for (const d of isArr(s.destinations) ? s.destinations : []) if (isObj(d)) L.push(line(`  deploy to   ${strOf(d.server || d.name)}  namespace ${strOf(d.namespace)}`, 'out'));
+      L.push(line(isArr(s.clusterResourceWhitelist) && s.clusterResourceWhitelist.length ? '  create cluster-wide: ' + s.clusterResourceWhitelist.map((e) => `${strOf(e.group) || 'core'}/${strOf(e.kind)}`).join(', ') : '  create cluster-wide resources: none (Namespaces, ClusterRoles... are refused)', 'out'));
+      for (const ro of isArr(s.roles) ? s.roles : []) if (isObj(ro)) L.push(line(`  role ${strOf(ro.name)}: ${(isArr(ro.policies) ? ro.policies : []).length} rule(s)`, 'out'));
+      L.push(line('An application that asks for anything else is refused: "not permitted in project".', 'why'));
+      return L;
+    }
+    if (kind === 'ApplicationSet') {
+      const info = r.info;
+      L.push(line(`ApplicationSet "${name}" makes Applications from its generator:`, 'cmd'));
+      if (info && info.lg) {
+        for (const e of info.lg) L.push(line(`  creates Application  ${acSub(info.tname, e)}`, 'changed'));
+      } else if (info && info.gens[0] && isObj(info.gens[0].git)) {
+        const g = info.gens[0].git;
+        L.push(line(`  looks in ${strOf(g.repoURL)} (${strOf(g.revision)})`, 'out'));
+        for (const d of isArr(g.directories) ? g.directories : []) if (isObj(d)) L.push(line(`  one Application for each folder matching ${strOf(d.path)}`, 'changed'));
+        L.push(line('  adding a folder adds an Application. Deleting a folder removes one.', 'why'));
+      } else if (info && info.gens[0] && isObj(info.gens[0].clusters)) L.push(line('  one Application for each cluster registered in Argo CD', 'changed'));
+      else L.push(line('  one Application for every item the generator returns', 'out'));
+      L.push(line('Deleting the ApplicationSet deletes the Applications it made.', 'why'));
+      return L;
+    }
+    const spec = v.spec;
+    const sp = isObj(spec.syncPolicy) ? spec.syncPolicy : {};
+    const auto = isObj(sp.automated) ? sp.automated : null;
+    const src = isObj(spec.source) ? spec.source : isArr(spec.sources) && isObj(spec.sources[0]) ? spec.sources[0] : {};
+    const fin = isObj(v.metadata) && isArr(v.metadata.finalizers) && v.metadata.finalizers.some((f) => /^resources-finalizer/.test(strOf(f)));
+    L.push(line(`Application "${name}":`, 'cmd'));
+    L.push(line(`  reads   ${strOf(src.repoURL)}  at ${strOf(src.targetRevision || 'HEAD')}  folder ${strOf(src.path || src.chart || '')}`, 'out'));
+    L.push(line(`  target  ${strOf(isObj(spec.destination) ? spec.destination.server || spec.destination.name : '')}  namespace ${strOf(isObj(spec.destination) ? spec.destination.namespace : '')}`, 'out'));
+    L.push(line('', 'out'));
+    L.push(line('When you push a change to Git:', 'cmd'));
+    L.push(line(auto ? '  Argo CD sees it within about 3 minutes and syncs by itself.' : '  Status turns OutOfSync. Nothing changes until you press Sync (argocd app sync).', 'changed'));
+    L.push(line('When someone edits a resource by hand in the cluster:', 'cmd'));
+    L.push(line(auto && auto.selfHeal ? '  Argo CD puts it back to what Git says (self-heal).' : '  Status turns OutOfSync, but the hand edit stays until the next sync.', 'changed'));
+    L.push(line('When a file is deleted from Git:', 'cmd'));
+    L.push(line(auto && auto.prune ? '  The resource is deleted from the cluster (prune).' : '  The resource stays in the cluster, shown as needing pruning.', 'changed'));
+    L.push(line('When a sync fails:', 'cmd'));
+    L.push(line(isObj(sp.retry) ? `  Argo CD tries again, up to ${strOf(sp.retry.limit)} time(s), waiting longer each time.` : '  The sync stops with Failed. Fix Git or the cluster, then sync again.', 'changed'));
+    L.push(line('When this Application is deleted:', 'cmd'));
+    L.push(line(fin ? '  Everything it deployed is deleted too (finalizer).' : '  The deployed resources keep running, with nothing managing them.', 'changed'));
+    L.push(line('# Argo CD runs in your cluster. This is a description, not a real sync.', 'why'));
+    return L;
+  }
+
+  /* ---------------------------------------------------------------- *
    *  Entry point
    * ---------------------------------------------------------------- */
 
@@ -2002,6 +2274,8 @@ const Tester = (() => {
         } else if (/(^|\/)\.github\/dependabot\.ya?ml$/.test(p)) {
           const d = checkDependabot(f, checks);
           if (d) runs.push({ title: 'What Dependabot would do', note: 'Simulated: describes what Dependabot would watch.', lines: dryDependabot(d) });
+        } else if (/\.ya?ml$/.test(p) && /^apiVersion:\s*argoproj\.io\//m.test(textOf(f))) {
+          for (const r of checkArgo(f, checks)) runs.push({ title: `What Argo CD would do: ${r.kind} ${strOf(r.v.metadata && r.v.metadata.name)}`.trim(), note: 'Simulated: describes what Argo CD would do with this file. Nothing contacts a cluster.', lines: dryArgo(r) });
         } else if (b === 'Jenkinsfile') {
           const info = checkJenkinsfile(f, checks);
           if (info && info.pipe) runs.push({ title: 'What Jenkins would do', note: 'Simulated: Stanza walks through your stages the way Jenkins would. Your own commands are not run.', lines: dryJenkins(info) });

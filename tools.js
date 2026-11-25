@@ -1701,6 +1701,9 @@ const JENKINS_TOOLS_LIST = JENKINS_ORDER.map((id) => JENKINS_TOOLS_ALL.find((x) 
 const GHA_TOOLS_ALL = typeof GITHUB_ACTIONS_TOOLS !== 'undefined' ? GITHUB_ACTIONS_TOOLS : require('./gha.js').GITHUB_ACTIONS_TOOLS;
 const GHA_ORDER = ['ci', 'matrix', 'docker', 'release', 'deploy', 'schedule', 'security'];
 const GHA_TOOLS_LIST = GHA_ORDER.map((id) => GHA_TOOLS_ALL.find((x) => x.id === id));
+const ARGOCD_TOOLS_ALL = typeof ARGOCD_TOOLS !== 'undefined' ? ARGOCD_TOOLS : require('./argocd.js').ARGOCD_TOOLS;
+const ARGOCD_ORDER = ['install', 'repo', 'project', 'application', 'appset'];
+const ARGOCD_TOOLS_LIST = ARGOCD_ORDER.map((id) => ARGOCD_TOOLS_ALL.find((x) => x.id === id));
 const TERRAFORM_TOOLS_LIST = typeof TERRAFORM_TOOLS !== 'undefined' ? TERRAFORM_TOOLS : require('./terraform.js').TERRAFORM_TOOLS;
 
 const SUITES = [
@@ -1750,6 +1753,19 @@ const SUITES = [
       { id: 'triggers', label: 'Triggers' },
       { id: 'expressions', label: 'Expressions' },
       { id: 'actions', label: 'Actions' },
+      { id: 'errors', label: 'Errors' },
+    ],
+  },
+  {
+    id: 'argocd',
+    label: 'Argo CD',
+    icon: 'brand/tools/argocd.svg',
+    tools: ARGOCD_TOOLS_LIST,
+    references: [
+      { id: 'concepts', label: 'Concepts' },
+      { id: 'commands', label: 'Commands' },
+      { id: 'fields', label: 'Fields' },
+      { id: 'statuses', label: 'Statuses' },
       { id: 'errors', label: 'Errors' },
     ],
   },
